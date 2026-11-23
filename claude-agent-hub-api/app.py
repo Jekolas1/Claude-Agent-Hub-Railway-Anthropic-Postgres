@@ -4,9 +4,12 @@ import mimetypes
 import os
 import re
 import secrets
+import threading
 import time
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -34,6 +37,8 @@ OPTIONAL_TOOLS = {
     # Runs Python in Anthropic's sandbox (Pillow etc.). Files saved to $OUTPUT_DIR come back to us.
     'code_execution': {'type': 'code_execution_20250825', 'name': 'code_execution'},
 }
+# Optional tools that run on this server (client tools), enabled per agent like OPTIONAL_TOOLS.
+SERVER_SIDE_TOOLS = {'fetch_image', 'remove_background'}
 MAX_VALUE = 30000
 MAX_FILE = 20 * 1024 * 1024
 IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
@@ -78,6 +83,10 @@ def init_db():
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY(agent_id, key)
         )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS schedules (
+            agent_id TEXT PRIMARY KEY REFERENCES agents(id), at_time TEXT NOT NULL,
+            message TEXT NOT NULL, notify TEXT, last_run DATE
+        )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS containers (
             agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, container_id TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(agent_id, conversation_id)
@@ -99,6 +108,7 @@ async def lifespan(app):
             if attempt == 11:
                 raise
             time.sleep(2)
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     yield
 
 
@@ -157,9 +167,9 @@ def upsert_agent(agent_id: str, request: AgentConfig, authorization: str | None 
     authorize(authorization)
     if not valid_agent_id(agent_id) or agent_id == SHARED:
         raise HTTPException(400, 'Invalid agent_id')
-    unknown = [t for t in request.tools if t not in OPTIONAL_TOOLS]
+    unknown = [t for t in request.tools if t not in OPTIONAL_TOOLS and t not in SERVER_SIDE_TOOLS]
     if unknown:
-        raise HTTPException(400, f'Unknown tools: {unknown}. Available: {sorted(OPTIONAL_TOOLS)}')
+        raise HTTPException(400, f'Unknown tools: {unknown}. Available: {sorted([*OPTIONAL_TOOLS, *SERVER_SIDE_TOOLS])}')
     with db() as conn:
         conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names) VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT(id) DO UPDATE SET instructions=EXCLUDED.instructions,
@@ -280,6 +290,144 @@ FILE_TOOLS_CODE = [
 ]
 
 
+# ---------------- Web images (allowed sites only) and background removal ----------------
+
+WEB_TOOLS = [
+    {'name': 'find_images',
+     'description': 'List image URLs on a web page (og:image first, then <img> tags). The page must be on one of the allowed sites listed in your current-state.md.',
+     'input_schema': {'type': 'object', 'properties': {'page_url': {'type': 'string'}}, 'required': ['page_url']}},
+    {'name': 'fetch_image',
+     'description': 'Download an image and store it as a file under save_as (a path from your instructions, e.g. "shared/gefen/2026-11-24-gefen-original.jpg"). Allowed only if the image is hosted on an allowed site, or appears on page_url and page_url is on an allowed site.',
+     'input_schema': {'type': 'object', 'properties': {'image_url': {'type': 'string'}, 'page_url': {'type': 'string'},
+                                                       'save_as': {'type': 'string'}}, 'required': ['image_url', 'save_as']}},
+]
+BG_TOOLS = [
+    {'name': 'remove_background',
+     'description': 'Remove the background of a stored image (rembg, model isnet-general-use) and store the result as a PNG with transparency under save_as.',
+     'input_schema': {'type': 'object', 'properties': {'key': {'type': 'string'}, 'save_as': {'type': 'string'}},
+                      'required': ['key', 'save_as']}},
+]
+BROWSER_HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36'}
+
+
+def host_of(url: str) -> str:
+    h = (urlparse(url).hostname or '').lower()
+    return h[4:] if h.startswith('www.') else h
+
+
+def allowed_hosts(conn, agent_id) -> set[str]:
+    row = conn.execute('SELECT value FROM knowledge WHERE agent_id=%s AND key=%s',
+                       (agent_id, f'Agents/{agent_id}/current-state.md')).fetchone()
+    return {host_of(u) for u in re.findall(r'https?://[^\s)<>"\']+', row[0] if row else '')} - {''}
+
+
+def is_allowed(url: str, hosts: set[str]) -> bool:
+    h = host_of(url)
+    return bool(h) and any(h == a or h.endswith('.' + a) for a in hosts)
+
+
+class _ImgParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.found = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'meta' and (a.get('property') or a.get('name') or '').lower() in ('og:image', 'og:image:url', 'twitter:image'):
+            self.found.insert(0, (a.get('content'), 'og:image'))
+        elif tag == 'img':
+            src = a.get('src') or a.get('data-src') or a.get('data-original') or (a.get('srcset') or '').split(' ')[0]
+            self.found.append((src, a.get('alt') or ''))
+
+
+def page_images(page_url: str) -> list[dict]:
+    r = httpx.get(page_url, timeout=20, follow_redirects=True, headers=BROWSER_HEADERS)
+    r.raise_for_status()
+    parser = _ImgParser()
+    parser.feed(r.text[:3_000_000])
+    out, seen = [], set()
+    for src, alt in parser.found:
+        if not src or src.startswith('data:'):
+            continue
+        url = urljoin(str(r.url), src.strip())
+        if url not in seen:
+            seen.add(url)
+            out.append({'url': url, 'alt': alt[:100]})
+    return out[:40]
+
+
+_rembg_lock = threading.Lock()
+_rembg_session = None
+
+
+def remove_bg(data: bytes) -> bytes:
+    global _rembg_session
+    with _rembg_lock:  # one at a time: the model needs ~1.5GB of memory
+        from rembg import new_session, remove
+        if _rembg_session is None:
+            _rembg_session = new_session('isnet-general-use')
+        return remove(data, session=_rembg_session)
+
+
+def web_tool(agent, name, args):
+    agent_id = agent['id']
+    with db() as conn:
+        hosts = allowed_hosts(conn, agent_id)
+    if name == 'find_images':
+        page = str(args.get('page_url', ''))
+        if not is_allowed(page, hosts):
+            return {'error': f'{host_of(page) or page} is not in the allowed sites list (Agents/{agent_id}/current-state.md).'}
+        try:
+            return {'page_url': page, 'images': page_images(page)}
+        except httpx.HTTPError as e:
+            return {'error': f'Could not load page: {type(e).__name__} {e}'[:300]}
+    if name == 'fetch_image':
+        img, page = str(args.get('image_url', '')), str(args.get('page_url', '') or '')
+        save_as = normalize_key(args.get('save_as', ''))
+        if not save_as:
+            return {'error': 'Missing save_as'}
+        if not save_as.startswith(f'Agents/{agent_id}/') and not agent['shared_write']:
+            return {'error': f'No permission to write shared key "{save_as}".'}
+        ok = is_allowed(img, hosts)
+        if not ok and page and is_allowed(page, hosts):
+            try:
+                ok = img in {i['url'] for i in page_images(page)}
+            except httpx.HTTPError:
+                ok = False
+        if not ok:
+            return {'error': 'Not allowed: the image is not hosted on an allowed site and was not found on an allowed page_url.'}
+        try:
+            r = httpx.get(img, timeout=30, follow_redirects=True, headers={**BROWSER_HEADERS, 'Referer': page or img})
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            return {'error': f'Download failed: {type(e).__name__}'}
+        mime = (r.headers.get('content-type') or '').split(';')[0].strip()
+        if not mime.startswith('image/') or not r.content or len(r.content) > 15 * 1024 * 1024:
+            return {'error': f'Not an image (content-type {mime or "?"}, {len(r.content)} bytes)'}
+        with db() as conn:
+            write_file(conn, agent_id if save_as.startswith(f'Agents/{agent_id}/') else SHARED, save_as, mime, r.content)
+        return {'saved': True, 'key': save_as, 'mime': mime, 'bytes': len(r.content), 'source': img}
+    if name == 'remove_background':
+        key, save_as = normalize_key(args.get('key', '')), normalize_key(args.get('save_as', ''))
+        if not save_as.lower().endswith('.png'):
+            return {'error': 'save_as must end with .png'}
+        if not save_as.startswith(f'Agents/{agent_id}/') and not agent['shared_write']:
+            return {'error': f'No permission to write shared key "{save_as}".'}
+        with db() as conn:
+            row = read_file(conn, agent_id, key)
+        if not row:
+            return {'error': f'File not found: {key}'}
+        try:
+            out = remove_bg(bytes(row[3]))
+        except Exception as e:
+            print(f'remove_background failed: {type(e).__name__}: {e}', flush=True)
+            return {'error': f'Background removal failed: {type(e).__name__}'}
+        with db() as conn:
+            write_file(conn, agent_id if save_as.startswith(f'Agents/{agent_id}/') else SHARED, save_as, 'image/png', out)
+        return {'saved': True, 'key': save_as, 'bytes': len(out), 'model': 'isnet-general-use'}
+    return {'error': 'Unknown tool'}
+
+
 def anthropic_client():
     return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=170.0)
 
@@ -296,6 +444,9 @@ def upload_to_anthropic(conn, owner, key, mime, data, cached_id=None):
 def call_tool(agent, name, args, ctx=None):
     agent_id, shared_write = agent['id'], agent['shared_write']
     ctx = ctx if ctx is not None else {'outgoing': [], 'uploads': []}
+    if name in ('find_images', 'fetch_image', 'remove_background'):
+        enabled = {'find_images': 'fetch_image', 'fetch_image': 'fetch_image', 'remove_background': 'remove_background'}[name]
+        return web_tool(agent, name, args) if enabled in (agent.get('tools') or []) else {'error': 'Tool not enabled'}
     if name == 'list_files':
         prefix = normalize_key(args.get('prefix', '') or '')
         with db() as conn:
@@ -389,6 +540,8 @@ def build_system(conn, agent, channel='api'):
             + 'Now: ' + datetime.now(TZ).strftime('%Y-%m-%d %H:%M (%A)') + ' Israel time.\n'
             + ('Channel: WhatsApp with Yotam. Keep replies short and readable on a phone. No markdown tables or '
                'headings; use *bold* sparingly.\n' if channel == 'whatsapp' else '')
+            + ('Channel: scheduled run. Nobody is chatting with you live: do the whole task without asking questions, '
+               'then end with a short summary of what you did and what is missing.\n' if channel == 'schedule' else '')
             + 'FILES: images, logos and PDFs are stored separately from knowledge (see list_files). '
             + 'To give the user an existing file, call send_file. '
             + (f"You have code execution (Python with Pillow, matplotlib, etc.; no internet in the sandbox). "
@@ -397,7 +550,12 @@ def build_system(conn, agent, channel='api'):
                f"$OUTPUT_DIR is sent to the user with your reply and stored under Agents/{agent['id']}/outputs/ - "
                f"so put only finished deliverables there, and run `ls \"$OUTPUT_DIR\"` to confirm. A file saved anywhere "
                f"else is NOT delivered. Never write lines like '[files sent: ...]' yourself: the server reports deliveries.\n"
-               if has_code(agent) else 'You cannot create new files.\n')
+               if has_code(agent) else 'You cannot create new files with code.\n')
+            + ('Web images: use find_images on a product page from an allowed site, then fetch_image with save_as set to '
+               'the file path from your instructions (without flai-work/). This replaces downloading on a computer.\n'
+               if 'fetch_image' in agent['tools'] else '')
+            + ('Background removal: call remove_background (rembg, isnet-general-use) instead of running rembg yourself.\n'
+               if 'remove_background' in agent['tools'] else '')
             + 'KNOWLEDGE INDEX:\n' + index + '\nFILES INDEX:\n' + files_index)
 
 
@@ -458,6 +616,8 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             raise HTTPException(502, f'Could not upload attachment to Claude: {e}')
     container = row[0] if row else None
     tools = BASE_TOOLS + (FILE_TOOLS_CODE if has_code(agent) else []) + \
+        (WEB_TOOLS if 'fetch_image' in agent['tools'] else []) + \
+        (BG_TOOLS if 'remove_background' in agent['tools'] else []) + \
         [OPTIONAL_TOOLS[t] for t in agent['tools'] if t in OPTIONAL_TOOLS]
     messages = [{'role': role, 'content': content} for role, content in history]
     messages.append({'role': 'user', 'content': first})
@@ -692,3 +852,122 @@ async def whapi_webhook(secret: str, request: Request, background: BackgroundTas
         if text.strip():
             background.add_task(handle_whatsapp, m['chat_id'], text)
     return {'ok': True}
+
+
+# ---------------- Schedules (e.g. Gefen every morning at 08:30) ----------------
+
+class ScheduleConfig(BaseModel):
+    at: str = Field(pattern=r'^([01]\d|2[0-3]):[0-5]\d$')  # HH:MM Israel time
+    message: str = Field(min_length=1, max_length=2000)
+    notify: str | None = None  # WhatsApp number to send the result to, e.g. 9725XXXXXXXX
+
+
+@app.put('/agents/{agent_id}/schedule')
+def put_schedule(agent_id: str, cfg: ScheduleConfig, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    notify = re.sub(r'\D', '', cfg.notify or '') or None
+    with db() as conn:
+        read_agent(conn, agent_id)
+        conn.execute('''INSERT INTO schedules(agent_id,at_time,message,notify) VALUES (%s,%s,%s,%s)
+            ON CONFLICT(agent_id) DO UPDATE SET at_time=EXCLUDED.at_time, message=EXCLUDED.message,
+            notify=EXCLUDED.notify''', (agent_id, cfg.at, cfg.message, notify))
+    return {'agent_id': agent_id, 'at': cfg.at, 'message': cfg.message, 'notify': notify}
+
+
+@app.delete('/agents/{agent_id}/schedule')
+def delete_schedule(agent_id: str, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        conn.execute('DELETE FROM schedules WHERE agent_id=%s', (agent_id,))
+    return {'deleted': True}
+
+
+@app.get('/schedules')
+def list_schedules(authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        rows = conn.execute('SELECT agent_id,at_time,message,notify,last_run FROM schedules ORDER BY at_time').fetchall()
+    return {'schedules': [{'agent_id': a, 'at': t, 'message': m, 'notify': n, 'last_run': str(l) if l else None}
+                          for a, t, m, n, l in rows]}
+
+
+def run_scheduled(agent_id: str, message: str, notify: str | None):
+    day = datetime.now(TZ).strftime('%Y-%m-%d')
+    print(f'schedule: running {agent_id}', flush=True)
+    try:
+        result = run_agent(agent_id, f'schedule:{day}', message, channel='schedule')
+        print(f"schedule: {agent_id} done, reply {len(result['text'])} chars", flush=True)
+        if notify and WHAPI_TOKEN:
+            chat = notify + '@s.whatsapp.net'
+            whapi_send_text(chat, result['text'])
+            for f in result['files']:
+                whapi_send_file(chat, f)
+    except Exception as e:
+        print(f'schedule: {agent_id} failed: {type(e).__name__}: {getattr(e, "detail", e)}', flush=True)
+        if notify and WHAPI_TOKEN:
+            whapi_send_text(notify + '@s.whatsapp.net', f'הריצה המתוזמנת של {agent_id} נכשלה: {getattr(e, "detail", type(e).__name__)}')
+
+
+@app.post('/agents/{agent_id}/schedule/run')
+def run_schedule_now(agent_id: str, background: BackgroundTasks, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        row = conn.execute('SELECT message,notify FROM schedules WHERE agent_id=%s', (agent_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, 'No schedule for this agent')
+    background.add_task(run_scheduled, agent_id, row[0], row[1])
+    return {'started': True, 'agent_id': agent_id}
+
+
+def scheduler_tick(now=None) -> list:
+    """Start every schedule that is due: once a day, at or after its time (up to 3 hours late, e.g. after a restart)."""
+    now = now or datetime.now(TZ)
+    started = []
+    with db() as conn:
+        due = conn.execute('''SELECT agent_id,at_time,message,notify FROM schedules
+            WHERE last_run IS NULL OR last_run < %s''', (now.date(),)).fetchall()
+    for agent_id, at, message, notify in due:
+        hh, mm = map(int, at.split(':'))
+        start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if not (start <= now <= start + timedelta(hours=3)):
+            continue
+        with db() as conn:  # claim atomically so a second replica would not run it too
+            claimed = conn.execute('''UPDATE schedules SET last_run=%s WHERE agent_id=%s
+                AND (last_run IS NULL OR last_run < %s) RETURNING 1''', (now.date(), agent_id, now.date())).fetchone()
+        if claimed:
+            threading.Thread(target=run_scheduled, args=(agent_id, message, notify), daemon=True).start()
+            started.append(agent_id)
+    return started
+
+
+def scheduler_loop():
+    while True:
+        try:
+            scheduler_tick()
+        except Exception as e:
+            print(f'scheduler error: {type(e).__name__}: {e}', flush=True)
+        time.sleep(30)
+
+
+# ---------------- Two-way sync with flai-work ----------------
+
+@app.get('/sync/manifest')
+def sync_manifest(authorization: str | None = Header(default=None)):
+    """Every knowledge entry and file with its sha256, so the sync script can tell who changed what."""
+    authorize(authorization)
+    with db() as conn:
+        k = conn.execute('''SELECT agent_id,key,encode(sha256(convert_to(value,'UTF8')),'hex'),updated_at
+            FROM knowledge ORDER BY key''').fetchall()
+        f = conn.execute('''SELECT agent_id,key,encode(sha256(data),'hex'),updated_at,mime FROM files ORDER BY key''').fetchall()
+    return {'knowledge': [{'scope': a, 'key': key, 'sha256': h, 'updated_at': t.isoformat()} for a, key, h, t in k],
+            'files': [{'scope': a, 'key': key, 'sha256': h, 'updated_at': t.isoformat(), 'mime': m} for a, key, h, t, m in f]}
+
+
+@app.get('/agents/{agent_id}/knowledge/{key:path}')
+def get_knowledge_entry(agent_id: str, key: str, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        row = conn.execute('SELECT value FROM knowledge WHERE agent_id=%s AND key=%s', (agent_id, normalize_key(key))).fetchone()
+    if not row:
+        raise HTTPException(404, 'Not found')
+    return Response(content=row[0].encode('utf-8'), media_type='text/plain; charset=utf-8')

@@ -55,7 +55,7 @@ The JSON response contains `reply`. Make will send this text back via WhatsApp. 
 - Knowledge keys are file paths (e.g. `clients/kulam.md`). Keys under `Agents/<id>/` are private to that agent; everything else lives in the `_shared` namespace that every agent can read. Only agents with `shared_write` can write shared keys.
 - Agents get `list_knowledge`, `read_knowledge`, `save_knowledge`, `search_knowledge`. Their instructions keep mentioning `flai-work/<path>`; the runtime maps it to key `<path>`.
 - `GET /agents` lists agents. `GET|PUT /agents/_shared/knowledge/...` manages shared knowledge.
-- `tools/sync_flai.sh` (macOS, no Python needed) or `tools/sync_flai.py` uploads gershon, gefen and tirosh (SKILL.md + text files) from `~/flai-work`. Re-run it to refresh the cloud copy after local edits. Images are not uploaded yet.
+- `tools/flai_sync.pl` (perl + curl, both on macOS) syncs `~/flai-work` and the cloud both ways; see below.
 
 ## WhatsApp via Whapi
 
@@ -68,3 +68,12 @@ Start a message with an agent's name ("גרשון, ...") to talk to it; later me
 - `PUT /agents/{id}/files/<key>` with the raw file as body stores a binary file (`_shared` allowed). `GET /agents/{id}/files` lists, `GET /agents/{id}/files/<key>` downloads.
 - Agents get `list_files` and `send_file`. With `"tools": ["code_execution"]` they also get Anthropic's sandbox (Python + Pillow, no internet) and `use_files` to copy stored files into it. Every file they save at the top level of `$OUTPUT_DIR` is stored under `Agents/<id>/outputs/<date>/` and returned with the reply (`files` in the API response, sent as image/document on WhatsApp).
 - Incoming WhatsApp images and documents are stored under `Agents/<id>/inbox/<date>/`, shown to the agent, and copied into its sandbox. Requires **Auto Download** on in the Whapi channel. The caption picks the agent like a text message.
+
+## Gefen in the cloud
+
+- Server-side tools per agent: `fetch_image` (adds `find_images` + `fetch_image`; only pages/images on the sites listed in the agent's `current-state.md`) and `remove_background` (rembg, `isnet-general-use`; the model is downloaded at build time, ~180MB, and needs ~1.5GB RAM while running).
+- Schedules: `PUT /agents/{id}/schedule` `{"at":"08:30","message":"הפעל את גפן","notify":null}` runs once a day in Israel time (up to 3 hours late after a restart). `POST /agents/{id}/schedule/run` runs it now. `GET /schedules` lists them. With `notify` set to a WhatsApp number, the result is sent there.
+
+## Two-way sync with flai-work
+
+`perl tools/flai_sync.pl [--dry-run]` (copy it to `~/flai-work/sync.pl`). Uses `GET /sync/manifest` (sha256 of every entry) and a local state file `.cloud-sync-state.json`. Changed on one side → copied to the other; changed on both → your file stays and the cloud version is saved as `<name>.cloud-conflict-<date>.<ext>`; nothing is ever deleted. Agent instructions and settings always go computer → cloud.
