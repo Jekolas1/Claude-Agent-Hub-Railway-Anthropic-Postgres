@@ -1,4 +1,6 @@
+import base64
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -10,7 +12,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 import psycopg
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.getenv('DATABASE_URL', '')
@@ -29,8 +31,12 @@ SHARED = '_shared'
 # Optional capabilities an agent can be given (PUT /agents/{id} -> "tools").
 OPTIONAL_TOOLS = {
     'web_search': {'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': 10},
+    # Runs Python in Anthropic's sandbox (Pillow etc.). Files saved to $OUTPUT_DIR come back to us.
+    'code_execution': {'type': 'code_execution_20250825', 'name': 'code_execution'},
 }
 MAX_VALUE = 30000
+MAX_FILE = 20 * 1024 * 1024
+IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
 
 
 def db():
@@ -65,6 +71,17 @@ def init_db():
             content TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )''')
         conn.execute('''CREATE INDEX IF NOT EXISTS idx_msgs ON messages(agent_id,conversation_id,id DESC)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS files (
+            agent_id TEXT NOT NULL REFERENCES agents(id),
+            key TEXT NOT NULL, mime TEXT NOT NULL, data BYTEA NOT NULL,
+            anthropic_file_id TEXT,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY(agent_id, key)
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS containers (
+            agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, container_id TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(agent_id, conversation_id)
+        )''')
         conn.execute('''INSERT INTO agents (id,instructions) VALUES (%s,%s) ON CONFLICT(id) DO NOTHING''',
                      (SHARED, 'Shared knowledge namespace. Not a chat agent.'))
 
@@ -182,6 +199,60 @@ def put_knowledge(agent_id: str, key: str, body: dict, authorization: str | None
     return {'saved': True, 'agent_id': agent_id, 'key': key}
 
 
+def guess_mime(key: str, fallback: str = 'application/octet-stream') -> str:
+    return mimetypes.guess_type(key)[0] or fallback
+
+
+def write_file(conn, agent_id, key, mime, data: bytes):
+    conn.execute('''INSERT INTO files(agent_id,key,mime,data) VALUES (%s,%s,%s,%s)
+        ON CONFLICT(agent_id,key) DO UPDATE SET mime=EXCLUDED.mime, data=EXCLUDED.data,
+        anthropic_file_id=NULL, updated_at=now()''', (agent_id, key, mime, data))
+
+
+def read_file(conn, agent_id, key):
+    """Own file first, then shared. Returns (owner, key, mime, data, anthropic_file_id) or None."""
+    return conn.execute('''SELECT agent_id,key,mime,data,anthropic_file_id FROM files
+        WHERE agent_id IN (%s,%s) AND key=%s ORDER BY (agent_id=%s) DESC LIMIT 1''',
+        (agent_id, SHARED, key, agent_id)).fetchone()
+
+
+@app.put('/agents/{agent_id}/files/{key:path}')
+async def put_file(agent_id: str, key: str, request: Request, authorization: str | None = Header(default=None)):
+    """Upload a binary file (logo, image, PDF). agent_id may be '_shared'. Body = raw bytes."""
+    authorize(authorization)
+    key, data = normalize_key(key), await request.body()
+    if not key or not data or len(data) > MAX_FILE:
+        raise HTTPException(400, 'Invalid key or file (max 20MB)')
+    mime = request.headers.get('content-type') or guess_mime(key)
+    if mime in ('application/x-www-form-urlencoded', 'application/octet-stream'):
+        mime = guess_mime(key)
+    with db() as conn:
+        if not conn.execute('SELECT 1 FROM agents WHERE id=%s', (agent_id,)).fetchone():
+            raise HTTPException(404, 'Agent not found')
+        write_file(conn, agent_id, key, mime, data)
+    return {'saved': True, 'agent_id': agent_id, 'key': key, 'mime': mime, 'bytes': len(data)}
+
+
+@app.get('/agents/{agent_id}/files')
+def list_files_api(agent_id: str, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        rows = conn.execute('''SELECT key,mime,length(data),updated_at FROM files WHERE agent_id=%s
+            ORDER BY key LIMIT 1000''', (agent_id,)).fetchall()
+    return {'agent_id': agent_id, 'files': [{'key': k, 'mime': m, 'bytes': n, 'updated_at': t.isoformat()}
+                                            for k, m, n, t in rows]}
+
+
+@app.get('/agents/{agent_id}/files/{key:path}')
+def get_file(agent_id: str, key: str, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    with db() as conn:
+        row = read_file(conn, agent_id, normalize_key(key))
+    if not row:
+        raise HTTPException(404, 'File not found')
+    return Response(content=bytes(row[3]), media_type=row[2])
+
+
 BASE_TOOLS = [
     {'name': 'list_knowledge',
      'description': 'List knowledge keys (file paths) you can read: your own and the shared ones. Optional prefix filter, e.g. "shared/gefen/" or "clients/".',
@@ -195,11 +266,64 @@ BASE_TOOLS = [
     {'name': 'search_knowledge',
      'description': 'Search your own and shared knowledge by keyword.',
      'input_schema': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}},
+    {'name': 'list_files',
+     'description': 'List stored binary files (images, logos, PDFs, earlier designs): your own and shared. Optional prefix, e.g. "Agents/gershon/logos/".',
+     'input_schema': {'type': 'object', 'properties': {'prefix': {'type': 'string'}}}},
+    {'name': 'send_file',
+     'description': 'Send a stored file (by key from list_files) to the user together with your reply. Use only for files the user should receive.',
+     'input_schema': {'type': 'object', 'properties': {'key': {'type': 'string'}}, 'required': ['key']}},
+]
+FILE_TOOLS_CODE = [
+    {'name': 'use_files',
+     'description': 'Copy stored files (keys from list_files, e.g. a logo) into your code execution sandbox so your Python code can open them. After this call they are available in the sandbox input directory.',
+     'input_schema': {'type': 'object', 'properties': {'keys': {'type': 'array', 'items': {'type': 'string'}}}, 'required': ['keys']}},
 ]
 
 
-def call_tool(agent, name, args):
+def anthropic_client():
+    return anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=170.0)
+
+
+def upload_to_anthropic(conn, owner, key, mime, data, cached_id=None):
+    """Put a stored file into Anthropic's Files API (cached per file) so code execution can read it."""
+    if cached_id:
+        return cached_id
+    meta = anthropic_client().files.upload(file=(key.rsplit('/', 1)[-1], bytes(data), mime))
+    conn.execute('UPDATE files SET anthropic_file_id=%s WHERE agent_id=%s AND key=%s', (meta.id, owner, key))
+    return meta.id
+
+
+def call_tool(agent, name, args, ctx=None):
     agent_id, shared_write = agent['id'], agent['shared_write']
+    ctx = ctx if ctx is not None else {'outgoing': [], 'uploads': []}
+    if name == 'list_files':
+        prefix = normalize_key(args.get('prefix', '') or '')
+        with db() as conn:
+            rows = conn.execute('''SELECT agent_id,key,mime,length(data) FROM files
+                WHERE agent_id IN (%s,%s) AND key LIKE %s ORDER BY key LIMIT 300''',
+                (agent_id, SHARED, prefix.replace('%', r'\%').replace('_', r'\_') + '%')).fetchall()
+        return {'files': [{'key': k, 'mime': m, 'bytes': n, 'scope': 'shared' if a == SHARED else 'private'}
+                          for a, k, m, n in rows]}
+    if name == 'send_file':
+        key = normalize_key(args.get('key', ''))
+        with db() as conn:
+            row = read_file(conn, agent_id, key)
+        if not row:
+            return {'error': f'File not found: {key}'}
+        ctx['outgoing'].append({'key': row[1], 'mime': row[2], 'filename': row[1].rsplit('/', 1)[-1], 'data': bytes(row[3])})
+        return {'queued': True, 'key': key, 'note': 'Will be sent with your reply.'}
+    if name == 'use_files':
+        done, missing = [], []
+        with db() as conn:
+            for key in [normalize_key(k) for k in (args.get('keys') or [])][:10]:
+                row = read_file(conn, agent_id, key)
+                if not row:
+                    missing.append(key)
+                    continue
+                ctx['uploads'].append(upload_to_anthropic(conn, row[0], row[1], row[2], row[3], row[4]))
+                done.append(key)
+        return {'added_to_sandbox': done, 'missing': missing,
+                'note': 'Files arrive in the sandbox with the next turn; list the input directory to find them.'}
     if name == 'list_knowledge':
         prefix = normalize_key(args.get('prefix', '') or '')
         with db() as conn:
@@ -236,6 +360,10 @@ def call_tool(agent, name, args):
     return {'error': 'Unknown tool'}
 
 
+def has_code(agent):
+    return 'code_execution' in (agent.get('tools') or [])
+
+
 def read_agent(conn, agent_id):
     row = conn.execute('SELECT id,instructions,tools,shared_write FROM agents WHERE id=%s', (agent_id,)).fetchone()
     if not row or agent_id == SHARED:
@@ -247,6 +375,9 @@ def build_system(conn, agent, channel='api'):
     keys = conn.execute('''SELECT agent_id,key FROM knowledge WHERE agent_id IN (%s,%s)
         ORDER BY key LIMIT 300''', (agent['id'], SHARED)).fetchall()
     index = '\n'.join(f"- {k} ({'shared' if a == SHARED else 'private'})" for a, k in keys) or '(empty)'
+    files = conn.execute('''SELECT agent_id,key FROM files WHERE agent_id IN (%s,%s)
+        ORDER BY key LIMIT 150''', (agent['id'], SHARED)).fetchall()
+    files_index = '\n'.join(f"- {k} ({'shared' if a == SHARED else 'private'})" for a, k in files) or '(none)'
     perms = ('You may write shared keys.' if agent['shared_write']
              else f"You may write only under Agents/{agent['id']}/ (shared keys are read-only for you).")
     return (agent['instructions']
@@ -257,57 +388,154 @@ def build_system(conn, agent, channel='api'):
             + 'Never claim a tool ran or a file was saved unless the tool result says so. Do not reveal credentials.\n'
             + 'Now: ' + datetime.now(TZ).strftime('%Y-%m-%d %H:%M (%A)') + ' Israel time.\n'
             + ('Channel: WhatsApp with Yotam. Keep replies short and readable on a phone. No markdown tables or '
-               'headings; use *bold* sparingly. You cannot send files or images yet: if your work produces one, '
-               'say so instead of pretending you sent it.\n' if channel == 'whatsapp' else '')
-            + 'KNOWLEDGE INDEX:\n' + index)
+               'headings; use *bold* sparingly.\n' if channel == 'whatsapp' else '')
+            + 'FILES: images, logos and PDFs are stored separately from knowledge (see list_files). '
+            + 'To give the user an existing file, call send_file. '
+            + (f"You have code execution (Python with Pillow, matplotlib, etc.; no internet in the sandbox). "
+               f"Canva is not connected in the cloud, so build images and documents with code. To use a stored "
+               f"file (e.g. a logo) in code, call use_files first. Every file you save at the top level of "
+               f"$OUTPUT_DIR is sent to the user with your reply and stored under Agents/{agent['id']}/outputs/ - "
+               f"so put only finished deliverables there, and run `ls \"$OUTPUT_DIR\"` to confirm.\n"
+               if has_code(agent) else 'You cannot create new files.\n')
+            + 'KNOWLEDGE INDEX:\n' + index + '\nFILES INDEX:\n' + files_index)
 
 
-def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 'api') -> str:
+def collect_file_ids(block) -> list[str]:
+    """file_ids of files code execution left in $OUTPUT_DIR (they sit inside *code_execution_tool_result blocks)."""
+    if 'code_execution_tool_result' not in getattr(block, 'type', ''):
+        return []
+    found = []
+    def walk(x):
+        if isinstance(x, dict):
+            if isinstance(x.get('file_id'), str):
+                found.append(x['file_id'])
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(block.model_dump())
+    return found
+
+
+def user_content(agent, message, attachments, conn):
+    """Text plus attachments: images are shown to Claude; with code execution, every file also goes to the sandbox."""
+    if not attachments:
+        return message
+    notes = ', '.join(a['key'] for a in attachments)
+    content = [{'type': 'text', 'text': (message or '(נשלח קובץ בלי טקסט)') + f'\n\n[Attached and stored as: {notes}]'}]
+    for a in attachments:
+        if a['mime'] in IMAGE_TYPES and len(a['data']) <= 5 * 1024 * 1024:
+            content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': a['mime'],
+                                                        'data': base64.b64encode(a['data']).decode()}})
+        elif a['mime'] == 'application/pdf' and len(a['data']) <= 20 * 1024 * 1024:
+            content.append({'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
+                                                           'data': base64.b64encode(a['data']).decode()}})
+        if has_code(agent):
+            content.append({'type': 'container_upload',
+                            'file_id': upload_to_anthropic(conn, a['owner'], a['key'], a['mime'], a['data'])})
+    return content
+
+
+def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 'api',
+              attachments: list | None = None) -> dict:
+    """Runs one turn. attachments: [{'key','mime','data'}] already stored in the files table for this agent.
+    Returns {'text': str, 'files': [{'key','mime','filename','data'}]}."""
+    attachments = attachments or []
+    client = anthropic_client()
     with db() as conn:
         agent = read_agent(conn, agent_id)
         system = build_system(conn, agent, channel)
         history = conn.execute('''SELECT role,content FROM (SELECT id,role,content FROM messages
             WHERE agent_id=%s AND conversation_id=%s ORDER BY id DESC LIMIT 16) t ORDER BY id''',
             (agent_id, conversation_id)).fetchall()
-    tools = BASE_TOOLS + [OPTIONAL_TOOLS[t] for t in agent['tools'] if t in OPTIONAL_TOOLS]
+        row = conn.execute('SELECT container_id FROM containers WHERE agent_id=%s AND conversation_id=%s',
+                           (agent_id, conversation_id)).fetchone() if has_code(agent) else None
+        try:
+            first = user_content(agent, message, [dict(a, owner=agent_id) for a in attachments], conn)
+        except anthropic.APIError as e:
+            raise HTTPException(502, f'Could not upload attachment to Claude: {e}')
+    container = row[0] if row else None
+    tools = BASE_TOOLS + (FILE_TOOLS_CODE if has_code(agent) else []) + \
+        [OPTIONAL_TOOLS[t] for t in agent['tools'] if t in OPTIONAL_TOOLS]
     messages = [{'role': role, 'content': content} for role, content in history]
-    messages.append({'role': 'user', 'content': message})
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=170.0)
-    texts = []
+    messages.append({'role': 'user', 'content': first})
+    ctx = {'outgoing': [], 'uploads': []}
+    texts, generated = [], []
     try:
-        for _ in range(12):
-            result = client.messages.create(model=CLAUDE_MODEL, max_tokens=8000, system=system,
-                                            messages=messages, tools=tools)
+        for _ in range(16):
+            kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=system, messages=messages, tools=tools)
+            if container:
+                kwargs['container'] = container
+            try:
+                result = client.messages.create(**kwargs)
+            except anthropic.BadRequestError as e:
+                if container and 'container' in str(e).lower():
+                    container = None  # expired container: start a fresh one
+                    kwargs.pop('container')
+                    result = client.messages.create(**kwargs)
+                else:
+                    raise
+            if getattr(result, 'container', None) and getattr(result.container, 'id', None):
+                container = result.container.id
             blocks = result.content
             texts += [b.text for b in blocks if b.type == 'text']
+            for b in blocks:
+                generated += [f for f in collect_file_ids(b) if f not in generated]
             tool_calls = [b for b in blocks if b.type == 'tool_use']
             if not tool_calls and result.stop_reason != 'pause_turn':
-                answer = '\n'.join(texts).strip()
-                with db() as conn:
-                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'user', message))
-                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'assistant', answer or '(no text)'))
-                return answer
+                break
             messages.append({'role': 'assistant', 'content': [b.model_dump(exclude_none=True) for b in blocks]})
             if tool_calls:
-                messages.append({'role': 'user', 'content': [
-                    {'type': 'tool_result', 'tool_use_id': b.id,
-                     'content': json.dumps(call_tool(agent, b.name, b.input), ensure_ascii=False)}
-                    for b in tool_calls]})
-            # pause_turn (long server-side web search): send the conversation back as is to let Claude continue.
+                results = [{'type': 'tool_result', 'tool_use_id': b.id,
+                            'content': json.dumps(call_tool(agent, b.name, b.input, ctx), ensure_ascii=False)}
+                           for b in tool_calls]
+                results += [{'type': 'container_upload', 'file_id': f} for f in ctx['uploads']]
+                ctx['uploads'] = []
+                messages.append({'role': 'user', 'content': results})
+            # pause_turn (long server-side tool): send the conversation back as is to let Claude continue.
+        else:
+            raise HTTPException(502, 'Agent tool loop exceeded')
+
+        # Files code execution produced: download, store under Agents/<id>/outputs/<date>/, send with the reply.
+        day = datetime.now(TZ).strftime('%Y-%m-%d')
+        for fid in generated:
+            meta = client.files.retrieve_metadata(fid)
+            data = client.files.download(fid).read()
+            name = re.sub(r'[^\w.\-]+', '_', getattr(meta, 'filename', None) or fid)
+            key = f'Agents/{agent_id}/outputs/{day}/{name}'
+            mime = getattr(meta, 'mime_type', None) or guess_mime(name)
+            with db() as conn:
+                write_file(conn, agent_id, key, mime, data)
+            ctx['outgoing'].append({'key': key, 'mime': mime, 'filename': name, 'data': data})
     except anthropic.APIStatusError as e:
         print(f'Claude API error {e.status_code}: {e.message}', flush=True)
         raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={CLAUDE_MODEL})')
     except anthropic.APIError as e:
         print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
         raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
-    raise HTTPException(502, 'Agent tool loop exceeded')
+
+    answer = '\n'.join(texts).strip()
+    sent = [f['key'] for f in ctx['outgoing']]
+    user_log = message + (f"\n[attached: {', '.join(a['key'] for a in attachments)}]" if attachments else '')
+    bot_log = (answer or '(no text)') + (f"\n[files sent: {', '.join(sent)}]" if sent else '')
+    with db() as conn:
+        conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'user', user_log))
+        conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'assistant', bot_log))
+        if container:
+            conn.execute('''INSERT INTO containers(agent_id,conversation_id,container_id) VALUES (%s,%s,%s)
+                ON CONFLICT(agent_id,conversation_id) DO UPDATE SET container_id=EXCLUDED.container_id, updated_at=now()''',
+                (agent_id, conversation_id, container))
+    return {'text': answer, 'files': ctx['outgoing']}
 
 
 @app.post('/agents/{agent_id}/chat')
 def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header(default=None)):
     authorize(authorization)
-    reply = run_agent(agent_id, request.conversation_id, request.message)
-    return {'agent_id': agent_id, 'conversation_id': request.conversation_id, 'reply': reply}
+    result = run_agent(agent_id, request.conversation_id, request.message)
+    return {'agent_id': agent_id, 'conversation_id': request.conversation_id, 'reply': result['text'],
+            'files': [{'key': f['key'], 'mime': f['mime'], 'url': f"/agents/{agent_id}/files/{f['key']}"}
+                      for f in result['files']]}
 
 
 # ---------------- WhatsApp (Whapi) ----------------
@@ -320,6 +548,27 @@ def whapi_send_text(to: str, body: str):
                        json={'to': to, 'body': body[i:i + 4000]})
         if r.status_code >= 300:
             print(f'Whapi send failed {r.status_code}: {r.text[:300]}', flush=True)
+
+
+def whapi_send_file(to: str, f: dict, caption: str = ''):
+    """Image endpoint for images, document endpoint for everything else. Tries a base64 data URI first,
+    then multipart upload, and logs Whapi's answer if both fail."""
+    kind = 'image' if f['mime'] in IMAGE_TYPES else 'document'
+    url, headers = f'{WHAPI_URL}/messages/{kind}', {'Authorization': f'Bearer {WHAPI_TOKEN}'}
+    extra = {'caption': caption} if caption else {}
+    if kind == 'document':
+        extra['filename'] = f['filename']
+    data_uri = f"data:{f['mime']};name={f['filename']};base64," + base64.b64encode(f['data']).decode()
+    r = httpx.post(url, timeout=120, headers=headers, json={'to': to, 'media': data_uri, **extra})
+    if r.status_code < 300:
+        return True
+    first = f'{r.status_code}: {r.text[:200]}'
+    r = httpx.post(url, timeout=120, headers=headers, data={'to': to, **extra},
+                   files={'media': (f['filename'], f['data'], f['mime'])})
+    if r.status_code < 300:
+        return True
+    print(f"Whapi file send failed for {f['key']} (json {first}) (multipart {r.status_code}: {r.text[:200]})", flush=True)
+    return False
 
 
 def route(conn, chat_id: str, text: str):
@@ -342,17 +591,46 @@ def agents_menu(conn) -> str:
     return 'עם מי לדבר? התחל את ההודעה בשם הסוכן: ' + ', '.join(names) + '.'
 
 
-def handle_whatsapp(chat_id: str, text: str):
+def fetch_media(m: dict):
+    """Download an incoming image/document from Whapi. Needs 'Auto Download' on in the Whapi channel settings."""
+    media = m.get(m.get('type')) or {}
+    link = media.get('link')
+    if not link:
+        return None, media
+    r = httpx.get(link, timeout=60, follow_redirects=True, headers={'Authorization': f'Bearer {WHAPI_TOKEN}'})
+    r.raise_for_status()
+    if len(r.content) > MAX_FILE:
+        raise ValueError('file larger than 20MB')
+    return r.content, media
+
+
+def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
     try:
         with db() as conn:
             agent_id, message = route(conn, chat_id, text)
             menu = agents_menu(conn)
         if not agent_id:
-            return whapi_send_text(chat_id, menu)
-        if not message:
+            return whapi_send_text(chat_id, menu + (' (את הקובץ שלח שוב אחרי שבחרת)' if media_msg else ''))
+        attachments = []
+        if media_msg:
+            data, media = fetch_media(media_msg)
+            if data is None:
+                return whapi_send_text(chat_id, 'לא הצלחתי להוריד את הקובץ. צריך להפעיל Auto Download בהגדרות הערוץ ב-Whapi.')
+            mime = (media.get('mime_type') or '').split(';')[0] or 'application/octet-stream'
+            ext = mimetypes.guess_extension(mime) or ''
+            name = re.sub(r'[^\w.\-]+', '_', media.get('filename') or f"{media_msg.get('type')}-{str(media_msg.get('id'))[-8:]}{ext}")
+            key = f"Agents/{agent_id}/inbox/{datetime.now(TZ).strftime('%Y-%m-%d')}/{name}"
+            with db() as conn:
+                write_file(conn, agent_id, key, mime, data)
+            attachments.append({'key': key, 'mime': mime, 'data': data})
+        elif not message:
             return whapi_send_text(chat_id, 'כאן. מה צריך?')
-        reply = run_agent(agent_id, 'wa:' + chat_id.split('@')[0], message, channel='whatsapp')
-        whapi_send_text(chat_id, reply)
+        result = run_agent(agent_id, 'wa:' + chat_id.split('@')[0], message, channel='whatsapp', attachments=attachments)
+        if result['text'] or not result['files']:
+            whapi_send_text(chat_id, result['text'])
+        failed = [f['filename'] for f in result['files'] if not whapi_send_file(chat_id, f)]
+        if failed:
+            whapi_send_text(chat_id, 'לא הצלחתי לשלוח: ' + ', '.join(failed) + '. הקבצים נשמרו בשרת.')
     except HTTPException as e:
         print(f'WhatsApp handling failed: {e.detail}', flush=True)
         whapi_send_text(chat_id, f'משהו נכשל בשרת: {e.detail}')
@@ -382,8 +660,12 @@ async def whapi_webhook(secret: str, request: Request, background: BackgroundTas
             text = (m.get('text') or {}).get('body', '')
         elif m.get('type') == 'link_preview':
             text = (m.get('link_preview') or {}).get('body', '')
+        elif m.get('type') in ('image', 'document'):
+            caption = (m.get(m['type']) or {}).get('caption', '') or ''
+            background.add_task(handle_whatsapp, m['chat_id'], caption, m)
+            continue
         else:
-            background.add_task(whapi_send_text, m['chat_id'], 'כרגע אני מבין רק הודעות טקסט. קול ותמונות יגיעו בשלב הבא.')
+            background.add_task(whapi_send_text, m['chat_id'], 'כרגע אני מבין טקסט, תמונות ומסמכים. הודעות קוליות יגיעו בשלב הבא.')
             continue
         if text.strip():
             background.add_task(handle_whatsapp, m['chat_id'], text)

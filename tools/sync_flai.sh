@@ -8,10 +8,11 @@ set -euo pipefail
 HUB="${HUB_URL:-https://claude-agent-hub-production.up.railway.app}"
 ROOT="${FLAI_WORK:-$HOME/flai-work}"
 # agent | tools (comma separated) | may write shared knowledge | names on WhatsApp (comma separated)
-AGENTS="gershon||true|גרשון
+AGENTS="gershon|code_execution|true|גרשון
 gefen|web_search|true|גפן
 tirosh||false|תירוש"
 MAX=30000
+MAX_FILE=$((20*1024*1024))
 
 [ -d "$ROOT" ] || { echo "Folder not found: $ROOT"; exit 1; }
 if [ -z "${HUB_TOKEN:-}" ]; then read -r -s -p "HUB_TOKEN (hidden): " HUB_TOKEN; echo; fi
@@ -37,7 +38,7 @@ json_agent() {  # {"instructions": <SKILL.md>, "tools": [...], "shared_write": b
       shared_write=>($ARGV[2] eq "true" ? JSON::PP::true : JSON::PP::false), names=>[grep {length} split /,/, $n]})' "$1" "$2" "$3" "$4"
 }
 
-urlpath() { perl -pe 's/([^A-Za-z0-9\/._~-])/sprintf("%%%02X",ord($1))/ge' <<<"$1"; }
+urlpath() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9\/._~-])/sprintf("%%%02X",ord($1))/ge'; }
 
 upload() {  # upload <agent_id> <file>
   local key="${2#"$ROOT"/}" chars
@@ -50,6 +51,17 @@ upload() {  # upload <agent_id> <file>
   echo "   + $key"
 }
 
+upload_file() {  # upload_file <agent_id> <file> : images, logos, PDFs
+  local key="${2#"$ROOT"/}" size mime code
+  size=$(wc -c <"$2" | tr -d ' ')
+  if [ "$size" -gt "$MAX_FILE" ]; then SKIPPED+="   - $key (over 20MB)"$'\n'; return 0; fi
+  mime=$(file -b --mime-type "$2" 2>/dev/null || echo application/octet-stream)
+  code=$(curl -s -o "$RESP" -w '%{http_code}' -X PUT "$HUB/agents/$1/files/$(urlpath "$key")" \
+    -H "Authorization: Bearer $HUB_TOKEN" -H "Content-Type: $mime" --data-binary @"$2")
+  if [ "$code" != 200 ]; then echo "✗ file $key -> $code $(head -c 300 "$RESP")"; exit 1; fi
+  echo "   + $key ($mime)"
+}
+
 while IFS='|' read -r agent tools shared names; do
   dir="$ROOT/Agents/$agent"
   skill="$dir/plugin/skills/$agent/SKILL.md"
@@ -59,7 +71,8 @@ while IFS='|' read -r agent tools shared names; do
   while IFS= read -r -d '' f; do
     case "$f" in
       *.md|*.txt|*.csv) upload "$agent" "$f" ;;
-      *) SKIPPED+="   - ${f#"$ROOT"/} (not uploaded yet)"$'\n' ;;
+      *.png|*.PNG|*.jpg|*.JPG|*.jpeg|*.JPEG|*.webp|*.gif|*.svg|*.pdf|*.PDF) upload_file "$agent" "$f" ;;
+      *) SKIPPED+="   - ${f#"$ROOT"/} (not uploaded)"$'\n' ;;
     esac
   done < <(find "$dir" -type f ! -name '.DS_Store' ! -path '*/plugin/*' -print0 | sort -z)
 done <<<"$AGENTS"
@@ -71,7 +84,7 @@ for d in clients shared; do
     < <(find "$ROOT/$d" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.csv' \) -print0 | sort -z)
 done
 
-[ -n "$SKIPPED" ] && printf '\nNot uploaded (images and the like come in a later stage):\n%s' "$SKIPPED"
+[ -n "$SKIPPED" ] && printf '\nNot uploaded:\n%s' "$SKIPPED"
 echo
 curl -s "$HUB/agents" -H "Authorization: Bearer $HUB_TOKEN"; echo
 echo "Done."
