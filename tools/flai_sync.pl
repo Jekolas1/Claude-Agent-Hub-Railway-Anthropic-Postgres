@@ -23,6 +23,7 @@ use File::Basename qw(dirname);
 use POSIX qw(strftime);
 
 binmode STDOUT, ':encoding(UTF-8)';
+binmode STDERR, ':encoding(UTF-8)';
 my $HUB  = $ENV{HUB_URL}   || 'https://claude-agent-hub-production.up.railway.app';
 my $ROOT = $ENV{FLAI_WORK} || "$ENV{HOME}/flai-work";
 my $DRY  = grep { $_ eq '--dry-run' } @ARGV;
