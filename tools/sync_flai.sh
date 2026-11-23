@@ -37,7 +37,7 @@ json_agent() {  # {"instructions": <SKILL.md>, "tools": [...], "shared_write": b
       shared_write=>($ARGV[2] eq "true" ? JSON::PP::true : JSON::PP::false), names=>[grep {length} split /,/, $n]})' "$1" "$2" "$3" "$4"
 }
 
-urlpath() { perl -pe 's/([^A-Za-z0-9\/._~-])/sprintf("%%%02X",ord($1))/ge' <<<"$1"; }
+urlpath() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9\/._~-])/sprintf("%%%02X",ord($1))/ge'; }
 
 upload() {  # upload <agent_id> <file>
   local key="${2#"$ROOT"/}" chars
