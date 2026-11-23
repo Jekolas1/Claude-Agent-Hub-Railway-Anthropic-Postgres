@@ -55,4 +55,4 @@ The JSON response contains `reply`. Make will send this text back via WhatsApp. 
 - Knowledge keys are file paths (e.g. `clients/kulam.md`). Keys under `Agents/<id>/` are private to that agent; everything else lives in the `_shared` namespace that every agent can read. Only agents with `shared_write` can write shared keys.
 - Agents get `list_knowledge`, `read_knowledge`, `save_knowledge`, `search_knowledge`. Their instructions keep mentioning `flai-work/<path>`; the runtime maps it to key `<path>`.
 - `GET /agents` lists agents. `GET|PUT /agents/_shared/knowledge/...` manages shared knowledge.
-- `tools/sync_flai.py` uploads gershon, gefen and tirosh (SKILL.md + text files) from `~/flai-work`. Re-run it to refresh the cloud copy after local edits. Images are not uploaded yet.
+- `tools/sync_flai.sh` (macOS, no Python needed) or `tools/sync_flai.py` uploads gershon, gefen and tirosh (SKILL.md + text files) from `~/flai-work`. Re-run it to refresh the cloud copy after local edits. Images are not uploaded yet.
