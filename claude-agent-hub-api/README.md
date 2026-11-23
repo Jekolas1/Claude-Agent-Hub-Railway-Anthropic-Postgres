@@ -62,3 +62,9 @@ The JSON response contains `reply`. Make will send this text back via WhatsApp. 
 Variables: `WHAPI_TOKEN` (channel token), `WEBHOOK_SECRET` (random, part of the webhook URL), `ALLOWED_NUMBERS` (comma separated, e.g. `972501234567`). In Whapi set the webhook to `https://YOUR-DOMAIN/whapi/<WEBHOOK_SECRET>` for incoming messages.
 
 Start a message with an agent's name ("גרשון, ...") to talk to it; later messages stay with that agent until you name another. Only text for now; voice and images come next. Messages from other numbers and from groups are ignored.
+
+## Files (images, logos, PDFs)
+
+- `PUT /agents/{id}/files/<key>` with the raw file as body stores a binary file (`_shared` allowed). `GET /agents/{id}/files` lists, `GET /agents/{id}/files/<key>` downloads.
+- Agents get `list_files` and `send_file`. With `"tools": ["code_execution"]` they also get Anthropic's sandbox (Python + Pillow, no internet) and `use_files` to copy stored files into it. Every file they save at the top level of `$OUTPUT_DIR` is stored under `Agents/<id>/outputs/<date>/` and returned with the reply (`files` in the API response, sent as image/document on WhatsApp).
+- Incoming WhatsApp images and documents are stored under `Agents/<id>/inbox/<date>/`, shown to the agent, and copied into its sandbox. Requires **Auto Download** on in the Whapi channel. The caption picks the agent like a text message.
