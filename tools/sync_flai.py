@@ -20,9 +20,9 @@ ROOT = Path(os.getenv('FLAI_WORK', Path.home() / 'flai-work'))
 
 # Which agents to upload, and what each one may do in the cloud.
 AGENTS = {
-    'gershon': {'tools': [], 'shared_write': True},            # opens client files in clients/
-    'gefen':   {'tools': ['web_search'], 'shared_write': True},  # writes to shared/gefen/
-    'tirosh':  {'tools': [], 'shared_write': False},           # reads gefen, writes only its own drafts
+    'gershon': {'tools': [], 'shared_write': True, 'names': ['גרשון']},            # opens client files in clients/
+    'gefen':   {'tools': ['web_search'], 'shared_write': True, 'names': ['גפן']},  # writes to shared/gefen/
+    'tirosh':  {'tools': [], 'shared_write': False, 'names': ['תירוש']},           # reads gefen, writes only its own drafts
 }
 # Shared folders every agent can read.
 SHARED_DIRS = ['clients', 'shared']

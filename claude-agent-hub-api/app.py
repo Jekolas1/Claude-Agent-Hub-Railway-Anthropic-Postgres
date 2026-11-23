@@ -1,18 +1,28 @@
 import json
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import anthropic
 import psycopg
-from fastapi import FastAPI, Header, HTTPException
+import httpx
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.getenv('DATABASE_URL', '')
 HUB_TOKEN = os.getenv('HUB_TOKEN', '')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
 CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', '')
+# WhatsApp via Whapi (optional: the webhook is disabled until these are set)
+WHAPI_TOKEN = os.getenv('WHAPI_TOKEN', '')
+WHAPI_URL = os.getenv('WHAPI_URL', 'https://gate.whapi.cloud')
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+ALLOWED_NUMBERS = {re.sub(r'\D', '', n) for n in os.getenv('ALLOWED_NUMBERS', '').split(',') if re.sub(r'\D', '', n)}
+TZ = ZoneInfo(os.getenv('TZ_NAME', 'Asia/Jerusalem'))
 
 # Knowledge every agent can read. Writing to it requires shared_write on the agent.
 SHARED = '_shared'
@@ -35,6 +45,14 @@ def init_db():
         )''')
         conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS tools JSONB NOT NULL DEFAULT '[]'")
         conn.execute('ALTER TABLE agents ADD COLUMN IF NOT EXISTS shared_write BOOLEAN NOT NULL DEFAULT false')
+        conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS names JSONB NOT NULL DEFAULT '[]'")
+        conn.execute('''CREATE TABLE IF NOT EXISTS wa_sessions (
+            chat_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS wa_seen (
+            message_id TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS knowledge (
             agent_id TEXT NOT NULL REFERENCES agents(id),
             key TEXT NOT NULL, value TEXT NOT NULL,
@@ -91,6 +109,7 @@ class AgentConfig(BaseModel):
     instructions: str = Field(min_length=10, max_length=60000)
     tools: list[str] = Field(default_factory=list)
     shared_write: bool = False
+    names: list[str] = Field(default_factory=list)  # names to call the agent by on WhatsApp, e.g. ["גרשון"]
 
 
 class ChatRequest(BaseModel):
@@ -112,8 +131,8 @@ def health():
 def list_agents(authorization: str | None = Header(default=None)):
     authorize(authorization)
     with db() as conn:
-        rows = conn.execute('SELECT id,tools,shared_write FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
-    return {'agents': [{'id': i, 'tools': t, 'shared_write': w} for i, t, w in rows]}
+        rows = conn.execute('SELECT id,tools,shared_write,names FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
+    return {'agents': [{'id': i, 'tools': t, 'shared_write': w, 'names': n} for i, t, w, n in rows]}
 
 
 @app.put('/agents/{agent_id}')
@@ -125,11 +144,13 @@ def upsert_agent(agent_id: str, request: AgentConfig, authorization: str | None 
     if unknown:
         raise HTTPException(400, f'Unknown tools: {unknown}. Available: {sorted(OPTIONAL_TOOLS)}')
     with db() as conn:
-        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write) VALUES (%s,%s,%s,%s)
+        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names) VALUES (%s,%s,%s,%s,%s)
             ON CONFLICT(id) DO UPDATE SET instructions=EXCLUDED.instructions,
-            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write''',
-            (agent_id, request.instructions, json.dumps(request.tools), request.shared_write))
-    return {'agent_id': agent_id, 'saved': True, 'tools': request.tools, 'shared_write': request.shared_write}
+            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write, names=EXCLUDED.names''',
+            (agent_id, request.instructions, json.dumps(request.tools), request.shared_write,
+             json.dumps(request.names, ensure_ascii=False)))
+    return {'agent_id': agent_id, 'saved': True, 'tools': request.tools, 'shared_write': request.shared_write,
+            'names': request.names}
 
 
 @app.get('/agents/{agent_id}/knowledge')
@@ -222,7 +243,7 @@ def read_agent(conn, agent_id):
     return {'id': row[0], 'instructions': row[1], 'tools': row[2] or [], 'shared_write': row[3]}
 
 
-def build_system(conn, agent):
+def build_system(conn, agent, channel='api'):
     keys = conn.execute('''SELECT agent_id,key FROM knowledge WHERE agent_id IN (%s,%s)
         ORDER BY key LIMIT 300''', (agent['id'], SHARED)).fetchall()
     index = '\n'.join(f"- {k} ({'shared' if a == SHARED else 'private'})" for a, k in keys) or '(empty)'
@@ -234,21 +255,23 @@ def build_system(conn, agent):
             + 'like flai-work/<path>, use read_knowledge / save_knowledge with key "<path>" '
             + '(e.g. flai-work/clients/kulam.md -> key "clients/kulam.md"). ' + perms + '\n'
             + 'Never claim a tool ran or a file was saved unless the tool result says so. Do not reveal credentials.\n'
+            + 'Now: ' + datetime.now(TZ).strftime('%Y-%m-%d %H:%M (%A)') + ' Israel time.\n'
+            + ('Channel: WhatsApp with Yotam. Keep replies short and readable on a phone. No markdown tables or '
+               'headings; use *bold* sparingly. You cannot send files or images yet: if your work produces one, '
+               'say so instead of pretending you sent it.\n' if channel == 'whatsapp' else '')
             + 'KNOWLEDGE INDEX:\n' + index)
 
 
-@app.post('/agents/{agent_id}/chat')
-def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header(default=None)):
-    authorize(authorization)
+def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 'api') -> str:
     with db() as conn:
         agent = read_agent(conn, agent_id)
-        system = build_system(conn, agent)
+        system = build_system(conn, agent, channel)
         history = conn.execute('''SELECT role,content FROM (SELECT id,role,content FROM messages
             WHERE agent_id=%s AND conversation_id=%s ORDER BY id DESC LIMIT 16) t ORDER BY id''',
-            (agent_id, request.conversation_id)).fetchall()
+            (agent_id, conversation_id)).fetchall()
     tools = BASE_TOOLS + [OPTIONAL_TOOLS[t] for t in agent['tools'] if t in OPTIONAL_TOOLS]
     messages = [{'role': role, 'content': content} for role, content in history]
-    messages.append({'role': 'user', 'content': request.message})
+    messages.append({'role': 'user', 'content': message})
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=170.0)
     texts = []
     try:
@@ -261,9 +284,9 @@ def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header
             if not tool_calls and result.stop_reason != 'pause_turn':
                 answer = '\n'.join(texts).strip()
                 with db() as conn:
-                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, request.conversation_id, 'user', request.message))
-                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, request.conversation_id, 'assistant', answer or '(no text)'))
-                return {'agent_id': agent_id, 'conversation_id': request.conversation_id, 'reply': answer}
+                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'user', message))
+                    conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'assistant', answer or '(no text)'))
+                return answer
             messages.append({'role': 'assistant', 'content': [b.model_dump(exclude_none=True) for b in blocks]})
             if tool_calls:
                 messages.append({'role': 'user', 'content': [
@@ -278,3 +301,90 @@ def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header
         print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
         raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
     raise HTTPException(502, 'Agent tool loop exceeded')
+
+
+@app.post('/agents/{agent_id}/chat')
+def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header(default=None)):
+    authorize(authorization)
+    reply = run_agent(agent_id, request.conversation_id, request.message)
+    return {'agent_id': agent_id, 'conversation_id': request.conversation_id, 'reply': reply}
+
+
+# ---------------- WhatsApp (Whapi) ----------------
+
+def whapi_send_text(to: str, body: str):
+    body = re.sub(r'\*\*(.+?)\*\*', r'*\1*', body or '').strip() or '(אין תשובה)'
+    for i in range(0, len(body), 4000):
+        r = httpx.post(f'{WHAPI_URL}/messages/text', timeout=30,
+                       headers={'Authorization': f'Bearer {WHAPI_TOKEN}'},
+                       json={'to': to, 'body': body[i:i + 4000]})
+        if r.status_code >= 300:
+            print(f'Whapi send failed {r.status_code}: {r.text[:300]}', flush=True)
+
+
+def route(conn, chat_id: str, text: str):
+    """Pick the agent: a message that starts with an agent's name switches to it; otherwise stay with the last one."""
+    agents = conn.execute('SELECT id,names FROM agents WHERE id<>%s', (SHARED,)).fetchall()
+    first, _, rest = text.strip().partition(' ')
+    word = first.strip(',:.!?;-').lower()
+    for agent_id, names in agents:
+        if word and word in {agent_id.lower(), *[n.lower() for n in (names or [])]}:
+            conn.execute('''INSERT INTO wa_sessions(chat_id,agent_id) VALUES (%s,%s)
+                ON CONFLICT(chat_id) DO UPDATE SET agent_id=EXCLUDED.agent_id, updated_at=now()''', (chat_id, agent_id))
+            return agent_id, rest.strip()
+    row = conn.execute('SELECT agent_id FROM wa_sessions WHERE chat_id=%s', (chat_id,)).fetchone()
+    return (row[0] if row else None), text.strip()
+
+
+def agents_menu(conn) -> str:
+    rows = conn.execute("SELECT id,names FROM agents WHERE id NOT IN (%s,'ping') ORDER BY id", (SHARED,)).fetchall()
+    names = [(n[0] if n else i) for i, n in rows]
+    return 'עם מי לדבר? התחל את ההודעה בשם הסוכן: ' + ', '.join(names) + '.'
+
+
+def handle_whatsapp(chat_id: str, text: str):
+    try:
+        with db() as conn:
+            agent_id, message = route(conn, chat_id, text)
+            menu = agents_menu(conn)
+        if not agent_id:
+            return whapi_send_text(chat_id, menu)
+        if not message:
+            return whapi_send_text(chat_id, 'כאן. מה צריך?')
+        reply = run_agent(agent_id, 'wa:' + chat_id.split('@')[0], message, channel='whatsapp')
+        whapi_send_text(chat_id, reply)
+    except HTTPException as e:
+        print(f'WhatsApp handling failed: {e.detail}', flush=True)
+        whapi_send_text(chat_id, f'משהו נכשל בשרת: {e.detail}')
+    except Exception as e:
+        print(f'WhatsApp handling crashed: {type(e).__name__}: {e}', flush=True)
+        whapi_send_text(chat_id, 'משהו נכשל בשרת. נסה שוב בעוד רגע.')
+
+
+@app.post('/whapi/{secret}')
+async def whapi_webhook(secret: str, request: Request, background: BackgroundTasks):
+    if not WEBHOOK_SECRET or not WHAPI_TOKEN or not secrets.compare_digest(secret, WEBHOOK_SECRET):
+        raise HTTPException(404, 'Not Found')
+    payload = await request.json()
+    for m in payload.get('messages') or []:
+        if m.get('from_me') or str(m.get('chat_id', '')).endswith('@g.us'):
+            continue  # our own messages and groups are ignored
+        sender = re.sub(r'\D', '', str(m.get('from', '')))
+        if sender not in ALLOWED_NUMBERS:
+            print(f'WhatsApp: ignored message from unapproved number ending {sender[-4:]}', flush=True)
+            continue
+        with db() as conn:
+            fresh = conn.execute('INSERT INTO wa_seen(message_id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING 1',
+                                 (str(m.get('id')),)).fetchone()
+        if not fresh:
+            continue  # Whapi retry of a message we already handled
+        if m.get('type') == 'text':
+            text = (m.get('text') or {}).get('body', '')
+        elif m.get('type') == 'link_preview':
+            text = (m.get('link_preview') or {}).get('body', '')
+        else:
+            background.add_task(whapi_send_text, m['chat_id'], 'כרגע אני מבין רק הודעות טקסט. קול ותמונות יגיעו בשלב הבא.')
+            continue
+        if text.strip():
+            background.add_task(handle_whatsapp, m['chat_id'], text)
+    return {'ok': True}

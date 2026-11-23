@@ -56,3 +56,9 @@ The JSON response contains `reply`. Make will send this text back via WhatsApp. 
 - Agents get `list_knowledge`, `read_knowledge`, `save_knowledge`, `search_knowledge`. Their instructions keep mentioning `flai-work/<path>`; the runtime maps it to key `<path>`.
 - `GET /agents` lists agents. `GET|PUT /agents/_shared/knowledge/...` manages shared knowledge.
 - `tools/sync_flai.sh` (macOS, no Python needed) or `tools/sync_flai.py` uploads gershon, gefen and tirosh (SKILL.md + text files) from `~/flai-work`. Re-run it to refresh the cloud copy after local edits. Images are not uploaded yet.
+
+## WhatsApp via Whapi
+
+Variables: `WHAPI_TOKEN` (channel token), `WEBHOOK_SECRET` (random, part of the webhook URL), `ALLOWED_NUMBERS` (comma separated, e.g. `972501234567`). In Whapi set the webhook to `https://YOUR-DOMAIN/whapi/<WEBHOOK_SECRET>` for incoming messages.
+
+Start a message with an agent's name ("גרשון, ...") to talk to it; later messages stay with that agent until you name another. Only text for now; voice and images come next. Messages from other numbers and from groups are ignored.

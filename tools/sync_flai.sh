@@ -7,10 +7,10 @@ set -euo pipefail
 
 HUB="${HUB_URL:-https://claude-agent-hub-production.up.railway.app}"
 ROOT="${FLAI_WORK:-$HOME/flai-work}"
-# agent | tools (comma separated) | may write shared knowledge
-AGENTS="gershon||true
-gefen|web_search|true
-tirosh||false"
+# agent | tools (comma separated) | may write shared knowledge | names on WhatsApp (comma separated)
+AGENTS="gershon||true|גרשון
+gefen|web_search|true|גפן
+tirosh||false|תירוש"
 MAX=30000
 
 [ -d "$ROOT" ] || { echo "Folder not found: $ROOT"; exit 1; }
@@ -30,10 +30,11 @@ json_value() {  # {"value": <file content>}
     print JSON::PP->new->ascii->encode({value=>$s})' "$1"
 }
 
-json_agent() {  # {"instructions": <SKILL.md>, "tools": [...], "shared_write": bool}
+json_agent() {  # {"instructions": <SKILL.md>, "tools": [...], "shared_write": bool, "names": [...]}
   perl -MJSON::PP -e 'open my $f,"<",$ARGV[0] or die "$ARGV[0]: $!"; local $/; my $s=<$f>; utf8::decode($s);
+    my $n=$ARGV[3]; utf8::decode($n);
     print JSON::PP->new->ascii->encode({instructions=>$s, tools=>[grep {length} split /,/, $ARGV[1]],
-      shared_write=>($ARGV[2] eq "true" ? JSON::PP::true : JSON::PP::false)})' "$1" "$2" "$3"
+      shared_write=>($ARGV[2] eq "true" ? JSON::PP::true : JSON::PP::false), names=>[grep {length} split /,/, $n]})' "$1" "$2" "$3" "$4"
 }
 
 urlpath() { perl -pe 's/([^A-Za-z0-9\/._~-])/sprintf("%%%02X",ord($1))/ge' <<<"$1"; }
@@ -49,12 +50,12 @@ upload() {  # upload <agent_id> <file>
   echo "   + $key"
 }
 
-while IFS='|' read -r agent tools shared; do
+while IFS='|' read -r agent tools shared names; do
   dir="$ROOT/Agents/$agent"
   skill="$dir/plugin/skills/$agent/SKILL.md"
   if [ ! -f "$skill" ]; then echo "! $agent: no SKILL.md, skipped"; continue; fi
-  json_agent "$skill" "$tools" "$shared" | put "/agents/$agent"
-  echo "✓ $agent (tools=[$tools], shared_write=$shared)"
+  json_agent "$skill" "$tools" "$shared" "$names" | put "/agents/$agent"
+  echo "✓ $agent ($names, tools=[$tools], shared_write=$shared)"
   while IFS= read -r -d '' f; do
     case "$f" in
       *.md|*.txt|*.csv) upload "$agent" "$f" ;;
