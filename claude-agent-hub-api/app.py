@@ -183,6 +183,10 @@ def chat(agent_id: str, request: ChatRequest, authorization: str | None = Header
                 output = call_tool(agent_id, block.name, block.input)
                 tool_results.append({'type':'tool_result','tool_use_id':block.id,'content':str(output)})
             messages.append({'role':'user','content':tool_results})
-    except anthropic.APIError:
-        raise HTTPException(502, 'Claude API request failed')
+    except anthropic.APIStatusError as e:
+        print(f'Claude API error {e.status_code}: {e.message}', flush=True)
+        raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={CLAUDE_MODEL})')
+    except anthropic.APIError as e:
+        print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
+        raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
     raise HTTPException(502, 'Agent tool loop exceeded')
