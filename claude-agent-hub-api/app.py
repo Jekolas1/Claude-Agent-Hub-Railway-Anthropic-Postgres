@@ -483,6 +483,9 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             for b in blocks:
                 generated += [f for f in collect_file_ids(b) if f not in generated]
             tool_calls = [b for b in blocks if b.type == 'tool_use']
+            used = [getattr(b, 'name', b.type) for b in blocks if b.type in ('tool_use', 'server_tool_use')]
+            if used:
+                print(f"agent {agent_id}: tools {used}", flush=True)
             if not tool_calls and result.stop_reason != 'pause_turn':
                 break
             messages.append({'role': 'assistant', 'content': [b.model_dump(exclude_none=True) for b in blocks]})
@@ -561,6 +564,7 @@ def whapi_send_file(to: str, f: dict, caption: str = ''):
     data_uri = f"data:{f['mime']};name={f['filename']};base64," + base64.b64encode(f['data']).decode()
     r = httpx.post(url, timeout=120, headers=headers, json={'to': to, 'media': data_uri, **extra})
     if r.status_code < 300:
+        print(f"WA file sent: {f['filename']} ({len(f['data'])} bytes)", flush=True)
         return True
     first = f'{r.status_code}: {r.text[:200]}'
     r = httpx.post(url, timeout=120, headers=headers, data={'to': to, **extra},
@@ -592,16 +596,26 @@ def agents_menu(conn) -> str:
 
 
 def fetch_media(m: dict):
-    """Download an incoming image/document from Whapi. Needs 'Auto Download' on in the Whapi channel settings."""
+    """Download an incoming image/document: first the direct link (Auto Download), then Whapi's GET /media/{id}."""
     media = m.get(m.get('type')) or {}
-    link = media.get('link')
-    if not link:
-        return None, media
-    r = httpx.get(link, timeout=60, follow_redirects=True, headers={'Authorization': f'Bearer {WHAPI_TOKEN}'})
-    r.raise_for_status()
-    if len(r.content) > MAX_FILE:
-        raise ValueError('file larger than 20MB')
-    return r.content, media
+    attempts = []
+    if media.get('link'):
+        attempts.append(('link', media['link'], {}))
+    if media.get('id'):
+        attempts.append(('media-api', f"{WHAPI_URL}/media/{media['id']}", {'Authorization': f'Bearer {WHAPI_TOKEN}'}))
+    for label, url, headers in attempts:
+        t = time.time()
+        try:
+            r = httpx.get(url, timeout=httpx.Timeout(20, read=45), follow_redirects=True, headers=headers)
+            if r.status_code < 300 and r.content:
+                if len(r.content) > MAX_FILE:
+                    raise ValueError('file larger than 20MB')
+                print(f'WA media: got {len(r.content)} bytes via {label} in {time.time() - t:.1f}s', flush=True)
+                return r.content, media
+            print(f'WA media: {label} -> {r.status_code} {r.text[:150]}', flush=True)
+        except httpx.HTTPError as e:
+            print(f'WA media: {label} failed after {time.time() - t:.1f}s: {type(e).__name__}', flush=True)
+    return None, media
 
 
 def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
@@ -615,7 +629,7 @@ def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
         if media_msg:
             data, media = fetch_media(media_msg)
             if data is None:
-                return whapi_send_text(chat_id, 'לא הצלחתי להוריד את הקובץ. צריך להפעיל Auto Download בהגדרות הערוץ ב-Whapi.')
+                return whapi_send_text(chat_id, 'לא הצלחתי להוריד את הקובץ מ-Whapi. נסה לשלוח שוב.')
             mime = (media.get('mime_type') or '').split(';')[0] or 'application/octet-stream'
             ext = mimetypes.guess_extension(mime) or ''
             name = re.sub(r'[^\w.\-]+', '_', media.get('filename') or f"{media_msg.get('type')}-{str(media_msg.get('id'))[-8:]}{ext}")
@@ -625,7 +639,9 @@ def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
             attachments.append({'key': key, 'mime': mime, 'data': data})
         elif not message:
             return whapi_send_text(chat_id, 'כאן. מה צריך?')
+        print(f'WA: -> {agent_id}, text {len(message)} chars, attachments {len(attachments)}', flush=True)
         result = run_agent(agent_id, 'wa:' + chat_id.split('@')[0], message, channel='whatsapp', attachments=attachments)
+        print(f"WA: <- {agent_id}, reply {len(result['text'])} chars, files {[f['filename'] for f in result['files']]}", flush=True)
         if result['text'] or not result['files']:
             whapi_send_text(chat_id, result['text'])
         failed = [f['filename'] for f in result['files'] if not whapi_send_file(chat_id, f)]
@@ -636,7 +652,7 @@ def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
         whapi_send_text(chat_id, f'משהו נכשל בשרת: {e.detail}')
     except Exception as e:
         print(f'WhatsApp handling crashed: {type(e).__name__}: {e}', flush=True)
-        whapi_send_text(chat_id, 'משהו נכשל בשרת. נסה שוב בעוד רגע.')
+        whapi_send_text(chat_id, f'משהו נכשל בשרת ({type(e).__name__}). נסה שוב בעוד רגע.')
 
 
 @app.post('/whapi/{secret}')
