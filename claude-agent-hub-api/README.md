@@ -48,3 +48,11 @@ The JSON response contains `reply`. Make will send this text back via WhatsApp. 
 - The web app does not send WhatsApp/audio/files yet. Make is the media gateway.
 - `health` is public by design and exposes only a minimal status.
 - Add request-id idempotency, retention rules, backups, budgets, logs/metrics and a queued worker before production scale.
+
+## Agents from flai-work (cloud runtime)
+
+- `PUT /agents/{id}` accepts `{"instructions": "...", "tools": ["web_search"], "shared_write": true}`.
+- Knowledge keys are file paths (e.g. `clients/kulam.md`). Keys under `Agents/<id>/` are private to that agent; everything else lives in the `_shared` namespace that every agent can read. Only agents with `shared_write` can write shared keys.
+- Agents get `list_knowledge`, `read_knowledge`, `save_knowledge`, `search_knowledge`. Their instructions keep mentioning `flai-work/<path>`; the runtime maps it to key `<path>`.
+- `GET /agents` lists agents. `GET|PUT /agents/_shared/knowledge/...` manages shared knowledge.
+- `tools/sync_flai.py` uploads gershon, gefen and tirosh (SKILL.md + text files) from `~/flai-work`. Re-run it to refresh the cloud copy after local edits. Images are not uploaded yet.
