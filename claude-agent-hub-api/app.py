@@ -395,7 +395,8 @@ def build_system(conn, agent, channel='api'):
                f"Canva is not connected in the cloud, so build images and documents with code. To use a stored "
                f"file (e.g. a logo) in code, call use_files first. Every file you save at the top level of "
                f"$OUTPUT_DIR is sent to the user with your reply and stored under Agents/{agent['id']}/outputs/ - "
-               f"so put only finished deliverables there, and run `ls \"$OUTPUT_DIR\"` to confirm.\n"
+               f"so put only finished deliverables there, and run `ls \"$OUTPUT_DIR\"` to confirm. A file saved anywhere "
+               f"else is NOT delivered. Never write lines like '[files sent: ...]' yourself: the server reports deliveries.\n"
                if has_code(agent) else 'You cannot create new files.\n')
             + 'KNOWLEDGE INDEX:\n' + index + '\nFILES INDEX:\n' + files_index)
 
@@ -518,10 +519,15 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
         print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
         raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
 
-    answer = '\n'.join(texts).strip()
+    # The model must not announce deliveries itself (it copies the history note format); the server does it.
+    answer = re.sub(r'^\s*[\[(⟦]\s*(files sent|system: files delivered)[^\n]*$', '', '\n'.join(texts),
+                    flags=re.IGNORECASE | re.MULTILINE).strip()
     sent = [f['key'] for f in ctx['outgoing']]
+    if has_code(agent) and not generated and re.search(r'(הנה|מצורפ|שלחתי|attached|here is)', answer, re.IGNORECASE):
+        print(f'agent {agent_id}: reply sounds like a file was delivered, but no file reached $OUTPUT_DIR', flush=True)
     user_log = message + (f"\n[attached: {', '.join(a['key'] for a in attachments)}]" if attachments else '')
-    bot_log = (answer or '(no text)') + (f"\n[files sent: {', '.join(sent)}]" if sent else '')
+    bot_log = (answer or '(no text)') + (f"\n(system: files delivered by the server: {', '.join(sent)})" if sent
+                                         else ('\n(system: no file was delivered in this turn)' if has_code(agent) else ''))
     with db() as conn:
         conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'user', user_log))
         conn.execute('INSERT INTO messages(agent_id,conversation_id,role,content) VALUES (%s,%s,%s,%s)', (agent_id, conversation_id, 'assistant', bot_log))
