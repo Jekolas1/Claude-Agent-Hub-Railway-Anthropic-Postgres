@@ -98,6 +98,11 @@ def init_db():
         )''')
         conn.execute('''INSERT INTO agents (id,instructions) VALUES (%s,%s) ON CONFLICT(id) DO NOTHING''',
                      (SHARED, 'Shared knowledge namespace. Not a chat agent.'))
+        for owner, key, mime in conn.execute('SELECT agent_id,key,mime FROM files').fetchall():
+            fixed = clean_mime(mime, key)
+            if fixed != mime:
+                conn.execute('UPDATE files SET mime=%s WHERE agent_id=%s AND key=%s', (fixed, owner, key))
+                print(f'files: fixed type of {key}: {mime[:60]!r} -> {fixed}', flush=True)
 
 
 @asynccontextmanager
@@ -218,6 +223,17 @@ def guess_mime(key: str, fallback: str = 'application/octet-stream') -> str:
     return mimetypes.guess_type(key)[0] or fallback
 
 
+MIME_RE = re.compile(r'^[a-z0-9][\w.+-]*/[\w.+-]+$', re.IGNORECASE)
+
+
+def clean_mime(mime: str | None, key: str) -> str:
+    """A real type/subtype, else a guess from the file name. Generic types also give way to the file name."""
+    m = (mime or '').split(';')[0].strip().lower()
+    if not MIME_RE.match(m) or m in ('application/x-www-form-urlencoded', 'application/octet-stream', 'text/plain'):
+        return guess_mime(key, m if MIME_RE.match(m) else 'application/octet-stream')
+    return m
+
+
 def write_file(conn, agent_id, key, mime, data: bytes):
     conn.execute('''INSERT INTO files(agent_id,key,mime,data) VALUES (%s,%s,%s,%s)
         ON CONFLICT(agent_id,key) DO UPDATE SET mime=EXCLUDED.mime, data=EXCLUDED.data,
@@ -238,9 +254,7 @@ async def put_file(agent_id: str, key: str, request: Request, authorization: str
     key, data = normalize_key(key), await request.body()
     if not key or not data or len(data) > MAX_FILE:
         raise HTTPException(400, 'Invalid key or file (max 20MB)')
-    mime = request.headers.get('content-type') or guess_mime(key)
-    if mime in ('application/x-www-form-urlencoded', 'application/octet-stream'):
-        mime = guess_mime(key)
+    mime = clean_mime(request.headers.get('content-type'), key)
     with db() as conn:
         if not conn.execute('SELECT 1 FROM agents WHERE id=%s', (agent_id,)).fetchone():
             raise HTTPException(404, 'Agent not found')
@@ -734,6 +748,7 @@ def whapi_send_text(to: str, body: str):
 def whapi_send_file(to: str, f: dict, caption: str = ''):
     """Image endpoint for images, document endpoint for everything else. Tries a base64 data URI first,
     then multipart upload, and logs Whapi's answer if both fail."""
+    f = dict(f, mime=clean_mime(f['mime'], f['filename']))
     kind = 'image' if f['mime'] in IMAGE_TYPES else 'document'
     url, headers = f'{WHAPI_URL}/messages/{kind}', {'Authorization': f'Bearer {WHAPI_TOKEN}'}
     extra = {'caption': caption} if caption else {}
