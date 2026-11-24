@@ -72,6 +72,8 @@ Start a message with an agent's name ("גרשון, ...") to talk to it; later me
 ## Gefen in the cloud
 
 - Server-side tools per agent: `fetch_image` (adds `find_images` + `fetch_image`; only pages/images on the sites listed in the agent's `current-state.md`) and `remove_background` (rembg, `isnet-general-use`; the model is downloaded at build time, ~180MB, and needs ~1.5GB RAM while running).
+  Background removal runs in its own process (`bg_worker.py`, images scaled to max 2000px): if it runs out of memory, only that step fails and the agent carries on.
+- Scheduled runs: each run writes `Agents/<id>/runs/<date>.md` (started / done / failed, tools used, the agent's summary); it syncs to flai-work. A run that started but never finished (server restart) is retried once after 30 minutes, at most two attempts a day. The agent is told to save its output file early and update it as it goes.
 - Schedules: `PUT /agents/{id}/schedule` `{"at":"08:30","message":"הפעל את גפן","notify":null}` runs once a day in Israel time (up to 3 hours late after a restart). `POST /agents/{id}/schedule/run` runs it now. `GET /schedules` lists them. With `notify` set to a WhatsApp number, the result is sent there.
 
 ## Two-way sync with flai-work

@@ -4,6 +4,8 @@ import mimetypes
 import os
 import re
 import secrets
+import subprocess
+import sys
 import threading
 import time
 from html.parser import HTMLParser
@@ -87,6 +89,9 @@ def init_db():
             agent_id TEXT PRIMARY KEY REFERENCES agents(id), at_time TEXT NOT NULL,
             message TEXT NOT NULL, notify TEXT, last_run DATE
         )''')
+        conn.execute('ALTER TABLE schedules ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ')
+        conn.execute('ALTER TABLE schedules ADD COLUMN IF NOT EXISTS finished DATE')
+        conn.execute('ALTER TABLE schedules ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0')
         conn.execute('''CREATE TABLE IF NOT EXISTS containers (
             agent_id TEXT NOT NULL, conversation_id TEXT NOT NULL, container_id TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(agent_id, conversation_id)
@@ -357,16 +362,18 @@ def page_images(page_url: str) -> list[dict]:
 
 
 _rembg_lock = threading.Lock()
-_rembg_session = None
+BG_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bg_worker.py')
 
 
 def remove_bg(data: bytes) -> bytes:
-    global _rembg_session
-    with _rembg_lock:  # one at a time: the model needs ~1.5GB of memory
-        from rembg import new_session, remove
-        if _rembg_session is None:
-            _rembg_session = new_session('isnet-general-use')
-        return remove(data, session=_rembg_session)
+    """Runs rembg in its own process (bg_worker.py). If it runs out of memory only that process dies,
+    not the server, so the agent gets an error and finishes the rest of its task."""
+    with _rembg_lock:  # one at a time: the model needs a lot of memory
+        p = subprocess.run([sys.executable, BG_WORKER], input=data, capture_output=True, timeout=240)
+    if p.returncode != 0 or not p.stdout:
+        reason = 'killed (probably out of memory)' if p.returncode < 0 else f'exit {p.returncode}'
+        raise RuntimeError(f"{reason}: {p.stderr.decode('utf-8', 'replace')[-300:]}")
+    return p.stdout
 
 
 def web_tool(agent, name, args):
@@ -421,7 +428,7 @@ def web_tool(agent, name, args):
             out = remove_bg(bytes(row[3]))
         except Exception as e:
             print(f'remove_background failed: {type(e).__name__}: {e}', flush=True)
-            return {'error': f'Background removal failed: {type(e).__name__}'}
+            return {'error': f'Background removal failed ({type(e).__name__}). Carry on without it and say so in your file.'}
         with db() as conn:
             write_file(conn, agent_id if save_as.startswith(f'Agents/{agent_id}/') else SHARED, save_as, 'image/png', out)
         return {'saved': True, 'key': save_as, 'bytes': len(out), 'model': 'isnet-general-use'}
@@ -541,7 +548,11 @@ def build_system(conn, agent, channel='api'):
             + ('Channel: WhatsApp with Yotam. Keep replies short and readable on a phone. No markdown tables or '
                'headings; use *bold* sparingly.\n' if channel == 'whatsapp' else '')
             + ('Channel: scheduled run. Nobody is chatting with you live: do the whole task without asking questions, '
-               'then end with a short summary of what you did and what is missing.\n' if channel == 'schedule' else '')
+               'then end with a short summary of what you did and what is missing.\n'
+               'Save your main output file (save_knowledge) as soon as you have its first details, and save it again '
+               'as you add more, so a later failure never loses the work. Never leave it to the very end. If a step '
+               'fails (an image, background removal, a site), note it in the file and carry on with the rest.\n'
+               if channel == 'schedule' else '')
             + 'FILES: images, logos and PDFs are stored separately from knowledge (see list_files). '
             + 'To give the user an existing file, call send_file. '
             + (f"You have code execution (Python with Pillow, matplotlib, etc.; no internet in the sandbox). "
@@ -622,9 +633,9 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
     messages = [{'role': role, 'content': content} for role, content in history]
     messages.append({'role': 'user', 'content': first})
     ctx = {'outgoing': [], 'uploads': []}
-    texts, generated = [], []
+    texts, generated, tools_used = [], [], []
     try:
-        for _ in range(16):
+        for _ in range(40 if channel == 'schedule' else 16):
             kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=system, messages=messages, tools=tools)
             if container:
                 kwargs['container'] = container
@@ -646,6 +657,7 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             tool_calls = [b for b in blocks if b.type == 'tool_use']
             used = [getattr(b, 'name', b.type) for b in blocks if b.type in ('tool_use', 'server_tool_use')]
             if used:
+                tools_used += used
                 print(f"agent {agent_id}: tools {used}", flush=True)
             if not tool_calls and result.stop_reason != 'pause_turn':
                 break
@@ -695,7 +707,7 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             conn.execute('''INSERT INTO containers(agent_id,conversation_id,container_id) VALUES (%s,%s,%s)
                 ON CONFLICT(agent_id,conversation_id) DO UPDATE SET container_id=EXCLUDED.container_id, updated_at=now()''',
                 (agent_id, conversation_id, container))
-    return {'text': answer, 'files': ctx['outgoing']}
+    return {'text': answer, 'files': ctx['outgoing'], 'tools': tools_used}
 
 
 @app.post('/agents/{agent_id}/chat')
@@ -891,12 +903,29 @@ def list_schedules(authorization: str | None = Header(default=None)):
                           for a, t, m, n, l in rows]}
 
 
+def run_log(agent_id: str, day: str, text: str):
+    """Agents/<id>/runs/<day>.md: what the scheduled run did. Synced to flai-work like any private file."""
+    try:
+        with db() as conn:
+            write_knowledge(conn, agent_id, f'Agents/{agent_id}/runs/{day}.md', text[:MAX_VALUE])
+    except Exception as e:
+        print(f'schedule: could not write run log: {type(e).__name__}: {e}', flush=True)
+
+
 def run_scheduled(agent_id: str, message: str, notify: str | None):
-    day = datetime.now(TZ).strftime('%Y-%m-%d')
+    now = datetime.now(TZ)
+    day, started = now.strftime('%Y-%m-%d'), now.strftime('%H:%M')
     print(f'schedule: running {agent_id}', flush=True)
+    run_log(agent_id, day, f'# {agent_id}: scheduled run {day}\n\n- started: {started}\n- status: running '
+            '(if it stays like this, the server stopped in the middle of the run)\n')
     try:
         result = run_agent(agent_id, f'schedule:{day}', message, channel='schedule')
         print(f"schedule: {agent_id} done, reply {len(result['text'])} chars", flush=True)
+        with db() as conn:
+            conn.execute('UPDATE schedules SET finished=%s WHERE agent_id=%s', (now.date(), agent_id))
+        run_log(agent_id, day, f"# {agent_id}: scheduled run {day}\n\n- started: {started}\n"
+                f"- finished: {datetime.now(TZ).strftime('%H:%M')}\n- status: done\n"
+                f"- tools: {', '.join(result.get('tools') or []) or '(none)'}\n\n## Agent summary\n\n{result['text'] or '(no text)'}\n")
         if notify and WHAPI_TOKEN:
             chat = notify + '@s.whatsapp.net'
             whapi_send_text(chat, result['text'])
@@ -904,6 +933,8 @@ def run_scheduled(agent_id: str, message: str, notify: str | None):
                 whapi_send_file(chat, f)
     except Exception as e:
         print(f'schedule: {agent_id} failed: {type(e).__name__}: {getattr(e, "detail", e)}', flush=True)
+        run_log(agent_id, day, f"# {agent_id}: scheduled run {day}\n\n- started: {started}\n"
+                f"- failed: {datetime.now(TZ).strftime('%H:%M')}\n- error: {type(e).__name__}: {getattr(e, 'detail', e)}\n")
         if notify and WHAPI_TOKEN:
             whapi_send_text(notify + '@s.whatsapp.net', f'הריצה המתוזמנת של {agent_id} נכשלה: {getattr(e, "detail", type(e).__name__)}')
 
@@ -924,16 +955,24 @@ def scheduler_tick(now=None) -> list:
     now = now or datetime.now(TZ)
     started = []
     with db() as conn:
+        # Due: not started today, or started today but never finished (the server restarted in the middle)
+        # and the last attempt is over 30 minutes old: one retry, two attempts a day at most.
+        stuck = now - timedelta(minutes=30)
         due = conn.execute('''SELECT agent_id,at_time,message,notify FROM schedules
-            WHERE last_run IS NULL OR last_run < %s''', (now.date(),)).fetchall()
+            WHERE last_run IS NULL OR last_run < %s
+               OR (last_run = %s AND (finished IS NULL OR finished < %s) AND attempts < 2 AND started_at < %s)''',
+            (now.date(), now.date(), now.date(), stuck)).fetchall()
     for agent_id, at, message, notify in due:
         hh, mm = map(int, at.split(':'))
         start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
         if not (start <= now <= start + timedelta(hours=3)):
             continue
         with db() as conn:  # claim atomically so a second replica would not run it too
-            claimed = conn.execute('''UPDATE schedules SET last_run=%s WHERE agent_id=%s
-                AND (last_run IS NULL OR last_run < %s) RETURNING 1''', (now.date(), agent_id, now.date())).fetchone()
+            claimed = conn.execute('''UPDATE schedules
+                SET attempts = CASE WHEN last_run = %s THEN attempts + 1 ELSE 1 END, last_run=%s, started_at=%s
+                WHERE agent_id=%s AND (last_run IS NULL OR last_run < %s
+                    OR (last_run = %s AND (finished IS NULL OR finished < %s) AND attempts < 2 AND started_at < %s))
+                RETURNING 1''', (now.date(), now.date(), now, agent_id, now.date(), now.date(), now.date(), stuck)).fetchone()
         if claimed:
             threading.Thread(target=run_scheduled, args=(agent_id, message, notify), daemon=True).start()
             started.append(agent_id)
