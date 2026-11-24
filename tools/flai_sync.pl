@@ -30,7 +30,7 @@ my $DRY  = grep { $_ eq '--dry-run' } @ARGV;
 # agent => [tools, may write shared knowledge, names on WhatsApp]
 my %AGENTS = (
     gershon => [['code_execution'], 1, ['גרשון']],
-    gefen   => [['web_search', 'fetch_image', 'remove_background'], 1, ['גפן']],
+    gefen   => [['web_search', 'fetch_image'], 1, ['גפן']],
     tirosh  => [[], 0, ['תירוש']],
 );
 # agent => [time (Israel), message, WhatsApp number to notify or '']
@@ -71,7 +71,11 @@ sub api {
 sub must { my ($what, $code, $resp) = @_; die "✗ $what -> $code " . substr($resp, 0, 300) . "\n" unless $code eq '200'; $resp }
 sub slurp { open(my $fh, '<:raw', $_[0]) or die "$_[0]: $!"; local $/; my $d = <$fh>; close $fh; $d }
 sub spew { my ($f, $d) = @_; make_path(dirname($f)); open(my $fh, '>:raw', $f) or die "$f: $!"; print $fh $d; close $fh }
-sub mime_of { my $f = shift; my $m = `file -b --mime-type "\Q$f\E" 2>/dev/null`; chomp $m; $m || 'application/octet-stream' }
+# By extension, not by running `file`: the old version escaped the path (\Q...\E inside quotes), `file` could not
+# open it, and its error text was uploaded as the file type, so images reached WhatsApp as unreadable documents.
+my %MIME = (png => 'image/png', jpg => 'image/jpeg', jpeg => 'image/jpeg', webp => 'image/webp', gif => 'image/gif',
+            svg => 'image/svg+xml', pdf => 'application/pdf');
+sub mime_of { my ($ext) = $_[0] =~ /\.([^.\/]+)$/; $MIME{ lc($ext // '') } || 'application/octet-stream' }
 
 # ---------- 1. Agent instructions and settings: computer -> cloud ----------
 for my $agent (sort keys %AGENTS) {
