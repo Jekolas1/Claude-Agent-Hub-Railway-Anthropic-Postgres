@@ -27,11 +27,12 @@ my $HUB  = $ENV{HUB_URL}   || 'https://claude-agent-hub-production.up.railway.ap
 my $ROOT = $ENV{FLAI_WORK} || "$ENV{HOME}/flai-work";
 my $DRY  = grep { $_ eq '--dry-run' } @ARGV;
 
-# agent => [tools, may write shared knowledge, names on WhatsApp]
+# agent => [tools, may write shared knowledge, names on WhatsApp, Claude model]
+# Model: Haiku is ~20x cheaper than Sonnet per token; '' = the CLAUDE_MODEL variable on Railway.
 my %AGENTS = (
-    gershon => [['code_execution'], 1, ['גרשון']],
-    gefen   => [['web_search', 'fetch_image'], 1, ['גפן']],
-    tirosh  => [[], 0, ['תירוש']],
+    gershon => [['code_execution'], 1, ['גרשון'], 'claude-sonnet-5-5'],
+    gefen   => [['web_search', 'fetch_image'], 1, ['גפן'], 'claude-haiku-5-5'],
+    tirosh  => [[], 0, ['תירוש'], 'claude-haiku-5-5'],
 );
 # agent => [time (Israel), message, WhatsApp number to notify or '']
 my %SCHEDULES = (
@@ -82,11 +83,11 @@ for my $agent (sort keys %AGENTS) {
     my $skill = "$ROOT/Agents/$agent/plugin/skills/$agent/SKILL.md";
     unless (-f $skill) { print "! $agent: no SKILL.md, skipped\n"; next }
     my $text = slurp($skill); utf8::decode($text);
-    my ($tools, $shared, $names) = @{ $AGENTS{$agent} };
+    my ($tools, $shared, $names, $model) = @{ $AGENTS{$agent} };
     my $body = JSON::PP->new->utf8->encode({ instructions => $text, tools => $tools,
-        shared_write => $shared ? JSON::PP::true : JSON::PP::false, names => $names });
+        shared_write => $shared ? JSON::PP::true : JSON::PP::false, names => $names, model => ($model || undef) });
     must("agent $agent", api('PUT', "/agents/$agent", body => $body)) unless $DRY;
-    print "✓ $agent (" . join(',', @$names) . ', tools=[' . join(',', @$tools) . "])\n";
+    print "✓ $agent (" . join(',', @$names) . ', tools=[' . join(',', @$tools) . '], model=' . ($model || 'default') . ")\n";
     if (my $s = $SCHEDULES{$agent}) {
         my $sb = JSON::PP->new->utf8->encode({ at => $s->[0], message => $s->[1], notify => ($s->[2] || undef) });
         must("schedule $agent", api('PUT', "/agents/$agent/schedule", body => $sb)) unless $DRY;

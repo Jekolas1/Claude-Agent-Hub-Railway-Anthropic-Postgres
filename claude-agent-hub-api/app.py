@@ -59,6 +59,7 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS tools JSONB NOT NULL DEFAULT '[]'")
         conn.execute('ALTER TABLE agents ADD COLUMN IF NOT EXISTS shared_write BOOLEAN NOT NULL DEFAULT false')
         conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS names JSONB NOT NULL DEFAULT '[]'")
+        conn.execute('ALTER TABLE agents ADD COLUMN IF NOT EXISTS model TEXT')  # NULL = CLAUDE_MODEL
         conn.execute('''CREATE TABLE IF NOT EXISTS wa_sessions (
             chat_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -147,6 +148,8 @@ class AgentConfig(BaseModel):
     tools: list[str] = Field(default_factory=list)
     shared_write: bool = False
     names: list[str] = Field(default_factory=list)  # names to call the agent by on WhatsApp, e.g. ["גרשון"]
+    # Claude model for this agent, e.g. "claude-haiku-5-5". Empty = the CLAUDE_MODEL variable.
+    model: str | None = Field(default=None, pattern=r'^$|^claude-[a-z0-9.-]+$', max_length=80)
 
 
 class ChatRequest(BaseModel):
@@ -168,8 +171,9 @@ def health():
 def list_agents(authorization: str | None = Header(default=None)):
     authorize(authorization)
     with db() as conn:
-        rows = conn.execute('SELECT id,tools,shared_write,names FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
-    return {'agents': [{'id': i, 'tools': t, 'shared_write': w, 'names': n} for i, t, w, n in rows]}
+        rows = conn.execute('SELECT id,tools,shared_write,names,model FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
+    return {'agents': [{'id': i, 'tools': t, 'shared_write': w, 'names': n, 'model': m or CLAUDE_MODEL}
+                       for i, t, w, n, m in rows]}
 
 
 @app.put('/agents/{agent_id}')
@@ -181,13 +185,13 @@ def upsert_agent(agent_id: str, request: AgentConfig, authorization: str | None 
     if unknown:
         raise HTTPException(400, f'Unknown tools: {unknown}. Available: {sorted([*OPTIONAL_TOOLS, *SERVER_SIDE_TOOLS])}')
     with db() as conn:
-        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names) VALUES (%s,%s,%s,%s,%s)
+        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names,model) VALUES (%s,%s,%s,%s,%s,%s)
             ON CONFLICT(id) DO UPDATE SET instructions=EXCLUDED.instructions,
-            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write, names=EXCLUDED.names''',
+            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write, names=EXCLUDED.names, model=EXCLUDED.model''',
             (agent_id, request.instructions, json.dumps(request.tools), request.shared_write,
-             json.dumps(request.names, ensure_ascii=False)))
+             json.dumps(request.names, ensure_ascii=False), request.model or None))
     return {'agent_id': agent_id, 'saved': True, 'tools': request.tools, 'shared_write': request.shared_write,
-            'names': request.names}
+            'names': request.names, 'model': request.model or CLAUDE_MODEL}
 
 
 @app.get('/agents/{agent_id}/knowledge')
@@ -537,10 +541,11 @@ def has_code(agent):
 
 
 def read_agent(conn, agent_id):
-    row = conn.execute('SELECT id,instructions,tools,shared_write FROM agents WHERE id=%s', (agent_id,)).fetchone()
+    row = conn.execute('SELECT id,instructions,tools,shared_write,model FROM agents WHERE id=%s', (agent_id,)).fetchone()
     if not row or agent_id == SHARED:
         raise HTTPException(404, 'Agent not found')
-    return {'id': row[0], 'instructions': row[1], 'tools': row[2] or [], 'shared_write': row[3]}
+    return {'id': row[0], 'instructions': row[1], 'tools': row[2] or [], 'shared_write': row[3],
+            'model': row[4] or CLAUDE_MODEL}
 
 
 def build_system(conn, agent, channel='api'):
@@ -690,7 +695,7 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
     texts, generated, tools_used = [], [], []
     try:
         for _ in range(40 if channel == 'schedule' else 16):
-            kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=cached_system(system),
+            kwargs = dict(model=agent['model'], max_tokens=8000, system=cached_system(system),
                           messages=with_cache_breakpoint(messages), tools=tools)
             if container:
                 kwargs['container'] = container
@@ -742,10 +747,10 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             ctx['outgoing'].append({'key': key, 'mime': mime, 'filename': name, 'data': data})
     except anthropic.APIStatusError as e:
         print(f'Claude API error {e.status_code}: {e.message}', flush=True)
-        raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={CLAUDE_MODEL})')
+        raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={agent['model']})')
     except anthropic.APIError as e:
         print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
-        raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
+        raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={agent['model']})')
 
     # The model must not announce deliveries itself (it copies the history note format); the server does it.
     answer = re.sub(r'^\s*[\[(⟦]\s*(files sent|system: files delivered)[^\n]*$', '', '\n'.join(texts),
