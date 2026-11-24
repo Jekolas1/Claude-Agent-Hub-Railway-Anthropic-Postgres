@@ -59,6 +59,7 @@ def init_db():
         conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS tools JSONB NOT NULL DEFAULT '[]'")
         conn.execute('ALTER TABLE agents ADD COLUMN IF NOT EXISTS shared_write BOOLEAN NOT NULL DEFAULT false')
         conn.execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS names JSONB NOT NULL DEFAULT '[]'")
+        conn.execute('ALTER TABLE agents ADD COLUMN IF NOT EXISTS model TEXT')  # NULL = CLAUDE_MODEL
         conn.execute('''CREATE TABLE IF NOT EXISTS wa_sessions (
             chat_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -147,6 +148,8 @@ class AgentConfig(BaseModel):
     tools: list[str] = Field(default_factory=list)
     shared_write: bool = False
     names: list[str] = Field(default_factory=list)  # names to call the agent by on WhatsApp, e.g. ["גרשון"]
+    # Claude model for this agent, e.g. "claude-haiku-5-5". Empty = the CLAUDE_MODEL variable.
+    model: str | None = Field(default=None, pattern=r'^$|^claude-[a-z0-9.-]+$', max_length=80)
 
 
 class ChatRequest(BaseModel):
@@ -168,8 +171,9 @@ def health():
 def list_agents(authorization: str | None = Header(default=None)):
     authorize(authorization)
     with db() as conn:
-        rows = conn.execute('SELECT id,tools,shared_write,names FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
-    return {'agents': [{'id': i, 'tools': t, 'shared_write': w, 'names': n} for i, t, w, n in rows]}
+        rows = conn.execute('SELECT id,tools,shared_write,names,model FROM agents WHERE id<>%s ORDER BY id', (SHARED,)).fetchall()
+    return {'agents': [{'id': i, 'tools': t, 'shared_write': w, 'names': n, 'model': m or CLAUDE_MODEL}
+                       for i, t, w, n, m in rows]}
 
 
 @app.put('/agents/{agent_id}')
@@ -181,13 +185,13 @@ def upsert_agent(agent_id: str, request: AgentConfig, authorization: str | None 
     if unknown:
         raise HTTPException(400, f'Unknown tools: {unknown}. Available: {sorted([*OPTIONAL_TOOLS, *SERVER_SIDE_TOOLS])}')
     with db() as conn:
-        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names) VALUES (%s,%s,%s,%s,%s)
+        conn.execute('''INSERT INTO agents (id,instructions,tools,shared_write,names,model) VALUES (%s,%s,%s,%s,%s,%s)
             ON CONFLICT(id) DO UPDATE SET instructions=EXCLUDED.instructions,
-            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write, names=EXCLUDED.names''',
+            tools=EXCLUDED.tools, shared_write=EXCLUDED.shared_write, names=EXCLUDED.names, model=EXCLUDED.model''',
             (agent_id, request.instructions, json.dumps(request.tools), request.shared_write,
-             json.dumps(request.names, ensure_ascii=False)))
+             json.dumps(request.names, ensure_ascii=False), request.model or None))
     return {'agent_id': agent_id, 'saved': True, 'tools': request.tools, 'shared_write': request.shared_write,
-            'names': request.names}
+            'names': request.names, 'model': request.model or CLAUDE_MODEL}
 
 
 @app.get('/agents/{agent_id}/knowledge')
@@ -537,10 +541,11 @@ def has_code(agent):
 
 
 def read_agent(conn, agent_id):
-    row = conn.execute('SELECT id,instructions,tools,shared_write FROM agents WHERE id=%s', (agent_id,)).fetchone()
+    row = conn.execute('SELECT id,instructions,tools,shared_write,model FROM agents WHERE id=%s', (agent_id,)).fetchone()
     if not row or agent_id == SHARED:
         raise HTTPException(404, 'Agent not found')
-    return {'id': row[0], 'instructions': row[1], 'tools': row[2] or [], 'shared_write': row[3]}
+    return {'id': row[0], 'instructions': row[1], 'tools': row[2] or [], 'shared_write': row[3],
+            'model': row[4] or CLAUDE_MODEL}
 
 
 def build_system(conn, agent, channel='api'):
@@ -621,6 +626,46 @@ def user_content(agent, message, attachments, conn):
     return content
 
 
+# ---------------- Prompt caching ----------------
+# Every step of a run resends the tools, the system prompt and the whole conversation so far. With two cache
+# breakpoints (end of the system prompt, end of the latest message) Anthropic stores that prefix for 5 minutes and
+# later steps pay the cache-read price for it instead of the full input price.
+CACHE = {'type': 'ephemeral'}
+CACHEABLE_BLOCKS = {'text', 'tool_result', 'image', 'document'}
+
+
+def cached_system(system: str) -> list:
+    return [{'type': 'text', 'text': system, 'cache_control': CACHE}]
+
+
+def with_cache_breakpoint(messages: list) -> list:
+    """Copy of messages with one cache breakpoint on the last block that can carry it (older ones removed:
+    the API allows at most 4 breakpoints per request)."""
+    out = []
+    for m in messages:
+        content = m['content']
+        if isinstance(content, list):
+            content = [{k: v for k, v in b.items() if k != 'cache_control'} if isinstance(b, dict) else b for b in content]
+        out.append({'role': m['role'], 'content': content})
+    for m in reversed(out):
+        if isinstance(m['content'], str):
+            if m['content'].strip():
+                m['content'] = [{'type': 'text', 'text': m['content'], 'cache_control': CACHE}]
+                return out
+            continue
+        for b in reversed(m['content']):
+            if isinstance(b, dict) and b.get('type') in CACHEABLE_BLOCKS and not (b.get('type') == 'text' and not b.get('text')):
+                b['cache_control'] = CACHE
+                return out
+    return out
+
+
+def usage_note(usage) -> str:
+    g = lambda k: getattr(usage, k, 0) or 0
+    return (f"in {g('input_tokens')} + cache write {g('cache_creation_input_tokens')} + "
+            f"cache read {g('cache_read_input_tokens')}, out {g('output_tokens')}")
+
+
 def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 'api',
               attachments: list | None = None) -> dict:
     """Runs one turn. attachments: [{'key','mime','data'}] already stored in the files table for this agent.
@@ -650,7 +695,8 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
     texts, generated, tools_used = [], [], []
     try:
         for _ in range(40 if channel == 'schedule' else 16):
-            kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=system, messages=messages, tools=tools)
+            kwargs = dict(model=agent['model'], max_tokens=8000, system=cached_system(system),
+                          messages=with_cache_breakpoint(messages), tools=tools)
             if container:
                 kwargs['container'] = container
             try:
@@ -670,6 +716,7 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
                 generated += [f for f in collect_file_ids(b) if f not in generated]
             tool_calls = [b for b in blocks if b.type == 'tool_use']
             used = [getattr(b, 'name', b.type) for b in blocks if b.type in ('tool_use', 'server_tool_use')]
+            print(f"agent {agent_id}: tokens {usage_note(result.usage)}", flush=True)
             if used:
                 tools_used += used
                 print(f"agent {agent_id}: tools {used}", flush=True)
@@ -700,10 +747,10 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
             ctx['outgoing'].append({'key': key, 'mime': mime, 'filename': name, 'data': data})
     except anthropic.APIStatusError as e:
         print(f'Claude API error {e.status_code}: {e.message}', flush=True)
-        raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={CLAUDE_MODEL})')
+        raise HTTPException(502, f'Claude API error {e.status_code}: {e.message} (model={agent['model']})')
     except anthropic.APIError as e:
         print(f'Claude API error: {type(e).__name__}: {e}', flush=True)
-        raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={CLAUDE_MODEL})')
+        raise HTTPException(502, f'Claude API error: {type(e).__name__} (model={agent['model']})')
 
     # The model must not announce deliveries itself (it copies the history note format); the server does it.
     answer = re.sub(r'^\s*[\[(⟦]\s*(files sent|system: files delivered)[^\n]*$', '', '\n'.join(texts),
