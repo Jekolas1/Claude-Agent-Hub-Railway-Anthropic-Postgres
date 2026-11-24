@@ -621,6 +621,46 @@ def user_content(agent, message, attachments, conn):
     return content
 
 
+# ---------------- Prompt caching ----------------
+# Every step of a run resends the tools, the system prompt and the whole conversation so far. With two cache
+# breakpoints (end of the system prompt, end of the latest message) Anthropic stores that prefix for 5 minutes and
+# later steps pay the cache-read price for it instead of the full input price.
+CACHE = {'type': 'ephemeral'}
+CACHEABLE_BLOCKS = {'text', 'tool_result', 'image', 'document'}
+
+
+def cached_system(system: str) -> list:
+    return [{'type': 'text', 'text': system, 'cache_control': CACHE}]
+
+
+def with_cache_breakpoint(messages: list) -> list:
+    """Copy of messages with one cache breakpoint on the last block that can carry it (older ones removed:
+    the API allows at most 4 breakpoints per request)."""
+    out = []
+    for m in messages:
+        content = m['content']
+        if isinstance(content, list):
+            content = [{k: v for k, v in b.items() if k != 'cache_control'} if isinstance(b, dict) else b for b in content]
+        out.append({'role': m['role'], 'content': content})
+    for m in reversed(out):
+        if isinstance(m['content'], str):
+            if m['content'].strip():
+                m['content'] = [{'type': 'text', 'text': m['content'], 'cache_control': CACHE}]
+                return out
+            continue
+        for b in reversed(m['content']):
+            if isinstance(b, dict) and b.get('type') in CACHEABLE_BLOCKS and not (b.get('type') == 'text' and not b.get('text')):
+                b['cache_control'] = CACHE
+                return out
+    return out
+
+
+def usage_note(usage) -> str:
+    g = lambda k: getattr(usage, k, 0) or 0
+    return (f"in {g('input_tokens')} + cache write {g('cache_creation_input_tokens')} + "
+            f"cache read {g('cache_read_input_tokens')}, out {g('output_tokens')}")
+
+
 def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 'api',
               attachments: list | None = None) -> dict:
     """Runs one turn. attachments: [{'key','mime','data'}] already stored in the files table for this agent.
@@ -650,7 +690,8 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
     texts, generated, tools_used = [], [], []
     try:
         for _ in range(40 if channel == 'schedule' else 16):
-            kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=system, messages=messages, tools=tools)
+            kwargs = dict(model=CLAUDE_MODEL, max_tokens=8000, system=cached_system(system),
+                          messages=with_cache_breakpoint(messages), tools=tools)
             if container:
                 kwargs['container'] = container
             try:
@@ -670,6 +711,7 @@ def run_agent(agent_id: str, conversation_id: str, message: str, channel: str = 
                 generated += [f for f in collect_file_ids(b) if f not in generated]
             tool_calls = [b for b in blocks if b.type == 'tool_use']
             used = [getattr(b, 'name', b.type) for b in blocks if b.type in ('tool_use', 'server_tool_use')]
+            print(f"agent {agent_id}: tokens {usage_note(result.usage)}", flush=True)
             if used:
                 tools_used += used
                 print(f"agent {agent_id}: tools {used}", flush=True)

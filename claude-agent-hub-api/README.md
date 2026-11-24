@@ -79,3 +79,7 @@ Start a message with an agent's name ("גרשון, ...") to talk to it; later me
 ## Two-way sync with flai-work
 
 `perl tools/flai_sync.pl [--dry-run]` (copy it to `~/flai-work/sync.pl`). Uses `GET /sync/manifest` (sha256 of every entry) and a local state file `.cloud-sync-state.json`. Changed on one side → copied to the other; changed on both → your file stays and the cloud version is saved as `<name>.cloud-conflict-<date>.<ext>`; nothing is ever deleted. Agent instructions and settings always go computer → cloud.
+
+## Cost
+- Prompt caching: every step of a run resends the tools, the system prompt and the conversation so far. The Hub marks two cache breakpoints (end of the system prompt, end of the latest message), so later steps within ~5 minutes pay the cache-read price for that prefix. Each step logs its tokens: `agent <id>: tokens in X + cache write Y + cache read Z, out W`.
+- The model for all agents is the `CLAUDE_MODEL` variable (e.g. `claude-haiku-5-5` is far cheaper than Sonnet for search-and-summarize agents).
