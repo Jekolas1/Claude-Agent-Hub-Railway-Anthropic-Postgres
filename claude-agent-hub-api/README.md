@@ -83,3 +83,17 @@ Start a message with an agent's name ("גרשון, ...") to talk to it; later me
 ## Cost
 - Prompt caching: every step of a run resends the tools, the system prompt and the conversation so far. The Hub marks two cache breakpoints (end of the system prompt, end of the latest message), so later steps within ~5 minutes pay the cache-read price for that prefix. Each step logs its tokens: `agent <id>: tokens in X + cache write Y + cache read Z, out W`.
 - The model for all agents is the `CLAUDE_MODEL` variable (e.g. `claude-haiku-5-5` is far cheaper than Sonnet for search-and-summarize agents).
+
+## WhatsApp via Meta's official Cloud API
+Runs next to Whapi; both numbers reach the same agents, with the same "name, message" routing and one conversation history per person.
+
+Railway variables:
+- `META_TOKEN`: System User token (business_management, whatsapp_business_messaging, whatsapp_business_management)
+- `META_PHONE_NUMBER_ID`: the number's phone number ID
+- `META_VERIFY_TOKEN`: any string; enter the same one as the Verify token at Meta
+- `META_APP_SECRET`: the app's App Secret (App settings > Basic); every webhook POST must carry a valid signature
+- `META_GRAPH_VERSION` (optional, default `v23.0`)
+- Reuses `WEBHOOK_SECRET` and `ALLOWED_NUMBERS`.
+
+Callback URL at Meta: `https://<hub>/meta/<WEBHOOK_SECRET>`, subscribed to the `messages` field.
+Outside the 24-hour window after the person's last message, Meta accepts only approved templates, so a scheduled notice can fail there (logged as `Meta send failed`).
