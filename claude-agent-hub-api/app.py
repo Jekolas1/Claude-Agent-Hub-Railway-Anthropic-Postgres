@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -28,6 +30,13 @@ CLAUDE_MODEL = os.getenv('CLAUDE_MODEL', '')
 WHAPI_TOKEN = os.getenv('WHAPI_TOKEN', '')
 WHAPI_URL = os.getenv('WHAPI_URL', 'https://gate.whapi.cloud')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+# WhatsApp via Meta's official Cloud API (optional: disabled until META_TOKEN and META_PHONE_NUMBER_ID are set).
+# Webhook: GET/POST /meta/{WEBHOOK_SECRET}. META_APP_SECRET checks that each POST really comes from Meta.
+META_TOKEN = os.getenv('META_TOKEN', '')                    # System User token
+META_PHONE_NUMBER_ID = os.getenv('META_PHONE_NUMBER_ID', '')
+META_VERIFY_TOKEN = os.getenv('META_VERIFY_TOKEN', '')      # any string; the same one is entered at Meta
+META_APP_SECRET = os.getenv('META_APP_SECRET', '')
+META_GRAPH = 'https://graph.facebook.com/' + os.getenv('META_GRAPH_VERSION', 'v23.0')
 ALLOWED_NUMBERS = {re.sub(r'\D', '', n) for n in os.getenv('ALLOWED_NUMBERS', '').split(',') if re.sub(r'\D', '', n)}
 TZ = ZoneInfo(os.getenv('TZ_NAME', 'Asia/Jerusalem'))
 
@@ -815,6 +824,86 @@ def whapi_send_file(to: str, f: dict, caption: str = ''):
     return False
 
 
+# ---------------- Meta WhatsApp Cloud API ----------------
+# chat ids: "meta:<number>" for the Meta number, "<number>@s.whatsapp.net" for Whapi.
+META_IMAGE_TYPES = {'image/jpeg', 'image/png'}  # what Meta accepts as an image message; the rest go as documents
+
+
+def wa_text(body: str) -> str:
+    return re.sub(r'\*\*(.+?)\*\*', r'*\1*', body or '').strip() or '(אין תשובה)'
+
+
+def meta_post(payload: dict) -> bool:
+    r = httpx.post(f'{META_GRAPH}/{META_PHONE_NUMBER_ID}/messages', timeout=30,
+                   headers={'Authorization': f'Bearer {META_TOKEN}'}, json={'messaging_product': 'whatsapp', **payload})
+    if r.status_code >= 300:
+        print(f'Meta send failed {r.status_code}: {r.text[:300]}', flush=True)
+        return False
+    return True
+
+
+def meta_send_text(to: str, body: str):
+    body = wa_text(body)
+    for i in range(0, len(body), 4000):  # Meta's limit is 4096 characters
+        meta_post({'to': to, 'type': 'text', 'text': {'body': body[i:i + 4000], 'preview_url': False}})
+
+
+def meta_send_file(to: str, f: dict, caption: str = '') -> bool:
+    """Upload the file to Meta, then send it as an image (jpeg/png) or a document."""
+    mime = clean_mime(f['mime'], f['filename'])
+    r = httpx.post(f'{META_GRAPH}/{META_PHONE_NUMBER_ID}/media', timeout=120,
+                   headers={'Authorization': f'Bearer {META_TOKEN}'},
+                   data={'messaging_product': 'whatsapp', 'type': mime},
+                   files={'file': (f['filename'], f['data'], mime)})
+    if r.status_code >= 300 or not r.json().get('id'):
+        print(f"Meta upload failed for {f['key']}: {r.status_code} {r.text[:200]}", flush=True)
+        return False
+    media = {'id': r.json()['id'], **({'caption': caption} if caption else {})}
+    if mime in META_IMAGE_TYPES:
+        ok = meta_post({'to': to, 'type': 'image', 'image': media})
+    else:
+        ok = meta_post({'to': to, 'type': 'document', 'document': {**media, 'filename': f['filename']}})
+    if ok:
+        print(f"Meta file sent: {f['filename']} ({len(f['data'])} bytes)", flush=True)
+    return ok
+
+
+def meta_fetch_media(media: dict):
+    """Incoming image/document: ask Graph for the file's URL, then download it with the token."""
+    try:
+        r = httpx.get(f"{META_GRAPH}/{media['id']}", timeout=20, headers={'Authorization': f'Bearer {META_TOKEN}'})
+        url = r.json().get('url') if r.status_code < 300 else None
+        if not url:
+            print(f'Meta media: lookup {r.status_code} {r.text[:150]}', flush=True)
+            return None
+        r = httpx.get(url, timeout=httpx.Timeout(20, read=60), headers={'Authorization': f'Bearer {META_TOKEN}'})
+        if r.status_code < 300 and r.content and len(r.content) <= MAX_FILE:
+            return r.content
+        print(f'Meta media: download {r.status_code}, {len(r.content)} bytes', flush=True)
+    except httpx.HTTPError as e:
+        print(f'Meta media: failed: {type(e).__name__}', flush=True)
+    return None
+
+
+def send_text(chat_id: str, body: str):
+    if chat_id.startswith('meta:'):
+        return meta_send_text(chat_id[5:], body)
+    return whapi_send_text(chat_id, body)
+
+
+def send_file(chat_id: str, f: dict, caption: str = '') -> bool:
+    if chat_id.startswith('meta:'):
+        return meta_send_file(chat_id[5:], f, caption)
+    return whapi_send_file(chat_id, f, caption)
+
+
+def notify_chat(number: str) -> str | None:
+    """Where scheduled-run notices go: the Meta number when it is set up, else Whapi."""
+    if META_TOKEN and META_PHONE_NUMBER_ID:
+        return 'meta:' + number
+    return number + '@s.whatsapp.net' if WHAPI_TOKEN else None
+
+
 def route(conn, chat_id: str, text: str):
     """Pick the agent: a message that starts with an agent's name switches to it; otherwise stay with the last one."""
     agents = conn.execute('SELECT id,names FROM agents WHERE id<>%s', (SHARED,)).fetchall()
@@ -859,40 +948,50 @@ def fetch_media(m: dict):
 
 
 def handle_whatsapp(chat_id: str, text: str, media_msg: dict | None = None):
+    """One incoming WhatsApp message, from Whapi or Meta. Meta messages carry media_msg = {'meta': {...}}."""
     try:
         with db() as conn:
             agent_id, message = route(conn, chat_id, text)
             menu = agents_menu(conn)
         if not agent_id:
-            return whapi_send_text(chat_id, menu + (' (את הקובץ שלח שוב אחרי שבחרת)' if media_msg else ''))
+            return send_text(chat_id, menu + (' (את הקובץ שלח שוב אחרי שבחרת)' if media_msg else ''))
         attachments = []
         if media_msg:
-            data, media = fetch_media(media_msg)
+            if 'meta' in media_msg:
+                media = media_msg['meta']
+                data = meta_fetch_media(media)
+                default_name = f"{media_msg.get('type', 'file')}-{str(media.get('id'))[-8:]}"
+            else:
+                data, media = fetch_media(media_msg)
+                default_name = f"{media_msg.get('type')}-{str(media_msg.get('id'))[-8:]}"
             if data is None:
-                return whapi_send_text(chat_id, 'לא הצלחתי להוריד את הקובץ מ-Whapi. נסה לשלוח שוב.')
+                return send_text(chat_id, 'לא הצלחתי להוריד את הקובץ. נסה לשלוח שוב.')
             mime = (media.get('mime_type') or '').split(';')[0] or 'application/octet-stream'
             ext = mimetypes.guess_extension(mime) or ''
-            name = re.sub(r'[^\w.\-]+', '_', media.get('filename') or f"{media_msg.get('type')}-{str(media_msg.get('id'))[-8:]}{ext}")
+            name = re.sub(r'[^\w.\-]+', '_', media.get('filename') or f'{default_name}{ext}')
             key = f"Agents/{agent_id}/inbox/{datetime.now(TZ).strftime('%Y-%m-%d')}/{name}"
             with db() as conn:
                 write_file(conn, agent_id, key, mime, data)
             attachments.append({'key': key, 'mime': mime, 'data': data})
         elif not message:
-            return whapi_send_text(chat_id, 'כאן. מה צריך?')
-        print(f'WA: -> {agent_id}, text {len(message)} chars, attachments {len(attachments)}', flush=True)
-        result = run_agent(agent_id, 'wa:' + chat_id.split('@')[0], message, channel='whatsapp', attachments=attachments)
+            return send_text(chat_id, 'כאן. מה צריך?')
+        number = re.sub(r'\D', '', chat_id.split('@')[0])
+        print(f'WA: -> {agent_id} via {"meta" if chat_id.startswith("meta:") else "whapi"}, '
+              f'text {len(message)} chars, attachments {len(attachments)}', flush=True)
+        # Same conversation for a person on either number, so history carries over.
+        result = run_agent(agent_id, 'wa:' + number, message, channel='whatsapp', attachments=attachments)
         print(f"WA: <- {agent_id}, reply {len(result['text'])} chars, files {[f['filename'] for f in result['files']]}", flush=True)
         if result['text'] or not result['files']:
-            whapi_send_text(chat_id, result['text'])
-        failed = [f['filename'] for f in result['files'] if not whapi_send_file(chat_id, f)]
+            send_text(chat_id, result['text'])
+        failed = [f['filename'] for f in result['files'] if not send_file(chat_id, f)]
         if failed:
-            whapi_send_text(chat_id, 'לא הצלחתי לשלוח: ' + ', '.join(failed) + '. הקבצים נשמרו בשרת.')
+            send_text(chat_id, 'לא הצלחתי לשלוח: ' + ', '.join(failed) + '. הקבצים נשמרו בשרת.')
     except HTTPException as e:
         print(f'WhatsApp handling failed: {e.detail}', flush=True)
-        whapi_send_text(chat_id, f'משהו נכשל בשרת: {e.detail}')
+        send_text(chat_id, f'משהו נכשל בשרת: {e.detail}')
     except Exception as e:
         print(f'WhatsApp handling crashed: {type(e).__name__}: {e}', flush=True)
-        whapi_send_text(chat_id, f'משהו נכשל בשרת ({type(e).__name__}). נסה שוב בעוד רגע.')
+        send_text(chat_id, f'משהו נכשל בשרת ({type(e).__name__}). נסה שוב בעוד רגע.')
 
 
 @app.post('/whapi/{secret}')
@@ -925,6 +1024,62 @@ async def whapi_webhook(secret: str, request: Request, background: BackgroundTas
             continue
         if text.strip():
             background.add_task(handle_whatsapp, m['chat_id'], text)
+    return {'ok': True}
+
+
+def meta_enabled(secret: str) -> bool:
+    return bool(WEBHOOK_SECRET and META_TOKEN and META_PHONE_NUMBER_ID
+                and secrets.compare_digest(secret, WEBHOOK_SECRET))
+
+
+@app.get('/meta/{secret}')
+def meta_verify(secret: str, request: Request):
+    """Meta checks the callback URL once, when the webhook is configured: echo hub.challenge."""
+    q = request.query_params
+    if (meta_enabled(secret) and META_VERIFY_TOKEN and q.get('hub.mode') == 'subscribe'
+            and secrets.compare_digest(q.get('hub.verify_token', ''), META_VERIFY_TOKEN)):
+        return Response(content=q.get('hub.challenge', ''), media_type='text/plain')
+    raise HTTPException(403, 'Verification failed')
+
+
+@app.post('/meta/{secret}')
+async def meta_webhook(secret: str, request: Request, background: BackgroundTasks):
+    if not meta_enabled(secret):
+        raise HTTPException(404, 'Not Found')
+    raw = await request.body()
+    if not META_APP_SECRET:
+        print('Meta webhook: META_APP_SECRET is not set, refusing unsigned events', flush=True)
+        raise HTTPException(403, 'App secret not configured')
+    expected = 'sha256=' + hmac.new(META_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(request.headers.get('x-hub-signature-256', ''), expected):
+        print('Meta webhook: bad signature, ignored', flush=True)
+        raise HTTPException(403, 'Bad signature')
+    payload = json.loads(raw or b'{}')
+    for entry in payload.get('entry') or []:
+        for change in entry.get('changes') or []:
+            value = change.get('value') or {}
+            if str((value.get('metadata') or {}).get('phone_number_id', '')) != str(META_PHONE_NUMBER_ID):
+                continue  # another number on the same account
+            for m in value.get('messages') or []:
+                sender = re.sub(r'\D', '', str(m.get('from', '')))
+                if sender not in ALLOWED_NUMBERS:
+                    print(f'Meta: ignored message from unapproved number ending {sender[-4:]}', flush=True)
+                    continue
+                with db() as conn:
+                    fresh = conn.execute('INSERT INTO wa_seen(message_id) VALUES (%s) ON CONFLICT DO NOTHING RETURNING 1',
+                                         (str(m.get('id')),)).fetchone()
+                if not fresh:
+                    continue  # Meta retry of a message we already handled
+                chat_id, kind = 'meta:' + sender, m.get('type')
+                if kind == 'text':
+                    text = (m.get('text') or {}).get('body', '')
+                    if text.strip():
+                        background.add_task(handle_whatsapp, chat_id, text)
+                elif kind in ('image', 'document'):
+                    media = m.get(kind) or {}
+                    background.add_task(handle_whatsapp, chat_id, media.get('caption', '') or '', {'type': kind, 'meta': media})
+                else:
+                    background.add_task(send_text, chat_id, 'כרגע אני מבין טקסט, תמונות ומסמכים. הודעות קוליות יגיעו בשלב הבא.')
     return {'ok': True}
 
 
@@ -988,17 +1143,18 @@ def run_scheduled(agent_id: str, message: str, notify: str | None):
         run_log(agent_id, day, f"# {agent_id}: scheduled run {day}\n\n- started: {started}\n"
                 f"- finished: {datetime.now(TZ).strftime('%H:%M')}\n- status: done\n"
                 f"- tools: {', '.join(result.get('tools') or []) or '(none)'}\n\n## Agent summary\n\n{result['text'] or '(no text)'}\n")
-        if notify and WHAPI_TOKEN:
-            chat = notify + '@s.whatsapp.net'
-            whapi_send_text(chat, result['text'])
+        chat = notify_chat(notify) if notify else None
+        if chat:
+            send_text(chat, result['text'])
             for f in result['files']:
-                whapi_send_file(chat, f)
+                send_file(chat, f)
     except Exception as e:
         print(f'schedule: {agent_id} failed: {type(e).__name__}: {getattr(e, "detail", e)}', flush=True)
         run_log(agent_id, day, f"# {agent_id}: scheduled run {day}\n\n- started: {started}\n"
                 f"- failed: {datetime.now(TZ).strftime('%H:%M')}\n- error: {type(e).__name__}: {getattr(e, 'detail', e)}\n")
-        if notify and WHAPI_TOKEN:
-            whapi_send_text(notify + '@s.whatsapp.net', f'הריצה המתוזמנת של {agent_id} נכשלה: {getattr(e, "detail", type(e).__name__)}')
+        chat = notify_chat(notify) if notify else None
+        if chat:
+            send_text(chat, f'הריצה המתוזמנת של {agent_id} נכשלה: {getattr(e, "detail", type(e).__name__)}')
 
 
 @app.post('/agents/{agent_id}/schedule/run')
